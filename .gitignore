@@ -1,0 +1,30 @@
+# Catkin and PX4 build outputs
+/build/
+/devel/
+/external/PX4-Autopilot/build/
+**/CMakeFiles/
+**/CMakeCache.txt
+**/catkin_make.cache
+**/__pycache__/
+*.py[cod]
+*:Zone.Identifier
+*Identifier
+
+# Local credentials and machine-specific files
+**/.env
+**/.env.*
+**/*.local
+
+# Simulation output and large generated data
+/start/experiments/
+/start/checkpoints/
+/start/logs/
+**/libtommath/logs/
+*.bag
+*.bag.active
+*.db3
+*.mcap
+
+# Editor and OS files
+.DS_Store
+Thumbs.db

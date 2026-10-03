@@ -1,0 +1,36 @@
+<launch>
+  <param name="/use_sim_time" value="true"/>
+  <arg name="fcu_url" default="udp://:14540@127.0.0.1:14557"/>
+  <arg name="gui" default="true"/>
+  <!-- Upstream node.launch requires MAVROS unless respawn is enabled. Keep
+       its PX4 configuration while allowing an isolated MAVROS exit. -->
+  <node pkg="mavros" type="mavros_node" name="mavros" required="false"
+        clear_params="true" output="screen">
+    <param name="fcu_url" value="$(arg fcu_url)"/>
+    <param name="gcs_url" value=""/>
+    <param name="target_system_id" value="1"/>
+    <param name="target_component_id" value="1"/>
+    <param name="fcu_protocol" value="v2.0"/>
+    <rosparam command="load" file="$(find mavros)/launch/px4_pluginlists.yaml"/>
+    <rosparam command="load" file="$(find mavros)/launch/px4_config.yaml"/>
+  </node>
+  <!-- Gazebo /clock and PX4 lockstep boot time share the same epoch.
+       Do not estimate a second offset: near-zero negative samples in the
+       installed MAVROS time filter wrap to huge unsigned offsets. This is
+       simulation-only; real hardware must use MAVLINK time synchronisation. -->
+  <param name="/mavros/time/timesync_mode" value="PASSTHROUGH"/>
+  <param name="/mavros/conn/timesync_rate" value="0.0"/>
+  <include file="$(find drone_stack)/launch/lio.launch"/>
+  <include file="$(find drone_stack)/launch/ego.launch"/>
+  <include file="$(find drone_stack)/launch/cameras.launch"/>
+  <!-- A manager exit must leave LIO/MAVROS running so PX4 can use its
+       OFFBOARD-loss landing fallback with external position still available. -->
+  <node pkg="drone_stack" type="flight_manager.py" name="drone_flight_manager" output="screen">
+    <param name="startup_min_time_s" value="65.0"/>
+    <!-- Faster-LIO scans and PX4 external-vision fusion can be about 0.25 s
+         delayed.  Keep a bounded margin for a short EGO CPU spike. -->
+    <param name="max_pose_age_s" value="0.70"/>
+    <param name="max_traj_age_s" value="0.50"/>
+  </node>
+  <node if="$(arg gui)" pkg="drone_stack" type="drone_operator_gui" name="drone_operator_gui" output="screen"/>
+</launch>
