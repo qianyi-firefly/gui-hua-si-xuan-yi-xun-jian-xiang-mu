@@ -1,8 +1,26 @@
 # 巡检四旋翼仿真进度
 
-更新时间：2026-10-03 14:03 CST。已恢复工作；core_live_15完整核心通过，extended_live_04多目标通过、走廊轨迹超时失败且安全降落。当前修复初始化坐标未稳定的历史占据残留，待构建和在线复测。
+更新时间：2026-10-03 14:58 CST。ROS模型生成/超时清理修复及低电量短复测通过；新core_live_17与extended_live_05监督器已启动。完整扩展未通过前不能实机验收。
 
 ## 最新运行状态（优先于下方历史记录）
+
+- 最新主会话18277 / 监督器54549：core_live_17新版本完整核心运行中，通过后执行extended_live_05全部17项。生产指纹ec4b6f871ac03d373f0ab5f383a90eafc7420f0ced97be7c1c7a4570ac750def。唯一仿真，源码与工具冻结。
+- ros_spawn_low_battery_short会话53154整轮通过，飞前只有20s悬停；低电量3.160s保护、反升0.002569m、漂移0.049623m、最终上锁，ULog通过，不代替完整60s回归。
+- ROS生成分支成功/明确失败/挂起三个实际shell分支检查通过（模拟ROS命令，测试超时缩短）；失败后TERM、2s后KILL并wait，防止世界进程令清理无限等待。prepare最终幂等与bash语法通过，24项配置与54项保护通过，ros_model_spawn_fix证据已保存。
+- 新实机交接文件src/drone_stack/HARDWARE_ACCEPTANCE.md，记录实机外参、时钟同步、真实点云/IMU格式、电池补偿和动力控制等必需差异，仍标未验证。
+
+- 主会话22339已失败退出，监督器53479因生产变化退出；extended_live_05未启动。low_battery_attempt_01世界在跑但模型缺失，gz model发现/生成请求无响应，PX4未启动。无飞行，ground_safety和land均失败，证据保留。已TERM停止拥有该世界的启动器，ROS/Gazebo已退出。
+- 生产prepare_px4_sitl对inspection_quad/ROS1使用timeout60s的gazebo_ros spawn_model服务调用，失败停止世界并退出；其它模型保持上游路径。验收timeout若无无人机记录模型名而不再次抛ValueError。prepare两次幂等和bash语法通过，24模型/54保护复核中；当前ros_spawn_low_battery_short仅20s悬停，是诊断不是完整回归。
+- live_16已通过：雷达0.524s/无反升/漂移0.012413m；雷达IMU0.768s/无反升/漂移0.026012m；授权撤销0.014s/无反升/漂移0.019281m；OFFBOARD原生0.608s/无反升/漂移0.027960m。整轮仍失败，不能宣称完整核心通过。
+
+- 当前主会话22339 / 监督器53479；生产d205216d...未变。core_live_16三轮整轮导航和ULog通过，三轮包络通过，最大跟踪0.176860/0.180261/0.193264m。前后60s Z范围：0.087548/0.107748、0.089866/0.109454、0.087303/0.109898m。当前fault_lidar_attempt_01，17项扩展仍待核心结束。不可修改源码或工具/启动第二套仿真。
+
+- ready_gate_scenes_01两场景完整通过，会话47676结束，无残留仿真。走廊28111真值样本、零包络重叠、最小间隙0.213581m、跟踪最大0.181671m；三维零重叠、最小间隙0.140671m、跟踪最大0.228032m，融合/降落上锁通过。修复前后地图切片已保存cloud_memory_ready_fix/ready_gate_occupancy_comparison.png并查看。
+- 最新唯一飞行是core_live_16，生产指纹d205216d4f5c080ab741ed31f336f924f35e1630d8e30e37b3a505022695d35d；监督器等待同版本核心全部通过后执行extended_live_05全部17项。源码与工具冻结，实机准备仍false。
+
+- 新构建生产指纹d205216d4f5c080ab741ed31f336f924f35e1630d8e30e37b3a505022695d35d；构建和24项模型/54项保护/12项工具检查通过。真实EGO回调ready_gate通过，证明首次READY清初始化残留，之后HOLD/READY保留盲区旧障碍。实验工具默认无门控参数时仍可对照retain/replace。
+- 当前唯一在线会话47676：ready_gate_scenes_01顺序corridor/three_d；走廊场景导航往返已通过，正在降落及整轮审计。禁止同时启动另一套仿真或修改源码/工具。完成两场景后执行core_live_16与extended_live_05全部17项。
+- core_live_15三轮导航包络审计全部通过，最大跟踪0.192850/0.132558/0.174318m；optimization_comparison图表已生成。旧通过只代表旧版本。
 
 - 2026-10-03恢复核对：原主会话13796/监督器35395均已结束，无残留ROS/PX4/Gazebo。core_live_15整轮通过，原生产指纹4e9644da...；extended_live_04/corridor首次目标无轨迹，5秒触发EGO-Planner trajectory timed out，地图在82.654s/FCU高度0.897m存在入口与中心虚假占据。失败bag/ULog/几何通过记录保留。
 - 当前正在增加地图初始化门控：drone配置订阅flight_state，首个READY清除初始化阶段地图并开始永久静态记忆；之前按当帧替换，之后HOLD/READY不得清除。其它上游应用无门控参数时保持原行为。生产已变化，旧核心通过不能代表新配置全回归通过。

@@ -99,6 +99,12 @@ class Contracts(unittest.TestCase):
         self.assertIsNotNone(parameter)
         self.assertEqual(parameter.get('value'),'true')
 
+    def test_cloud_memory_waits_for_localization_ready(self):
+        launch=ET.parse(ROOT/'launch/ego.launch').getroot()
+        parameter=launch.find("param[@name='/ego_planner_node/grid_map/cloud_memory_start_topic']")
+        self.assertIsNotNone(parameter)
+        self.assertEqual(parameter.get('value'),'/drone/flight_state')
+
     def test_lidar_simulation_scan_contract(self):
         lidar=self.model.find(".//sensor[@name='mid360_sim']")
         self.assertEqual(float(lidar.findtext('update_rate')),10)

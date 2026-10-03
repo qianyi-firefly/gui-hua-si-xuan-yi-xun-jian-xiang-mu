@@ -125,6 +125,35 @@ header += f"""
                  '\tif [ "$model" == "inspection_quad" ]; then spawn_z=0.17; fi\n'
                  '\twhile gz model --verbose --spawn-file="${modelpath}/${model}/${model_name}.sdf" --model-name=${model} -x 1.01 -y 0.98 -z "$spawn_z" 2>&1',
                  'spawn_z=0.83')
+    replace_once(sitl_run,
+                 '\twhile gz model --verbose --spawn-file="${modelpath}/${model}/${model_name}.sdf" --model-name=${model} -x 1.01 -y 0.98 -z "$spawn_z" 2>&1 | grep -q "An instance of Gazebo is not running."; do\n'
+                 '\t\techo "gzserver not ready yet, trying again!"\n'
+                 '\t\tsleep 1\n'
+                 '\tdone',
+                 '\t# inspection_ros_spawn: use the owned ROS service, not Gazebo discovery.\n'
+                 '\tif [[ "$model" == "inspection_quad" && "$ROS_VERSION" == "1" ]]; then\n'
+                 '\t\tif ! timeout --signal=TERM --kill-after=5s 60s rosrun gazebo_ros spawn_model -sdf '
+                 '-file "${modelpath}/${model}/${model_name}.sdf" -model "$model" '
+                 '-x 1.01 -y 0.98 -z "$spawn_z"; then\n'
+                 '\t\t\techo "Inspection model spawn failed or timed out" >&2\n'
+                 '\t\t\tkill -TERM "$SIM_PID" 2>/dev/null || true\n'
+                 '\t\t\twait "$SIM_PID" 2>/dev/null || true\n'
+                 '\t\t\texit 1\n'
+                 '\t\tfi\n'
+                 '\telse\n'
+                 '\t\twhile gz model --verbose --spawn-file="${modelpath}/${model}/${model_name}.sdf" --model-name=${model} -x 1.01 -y 0.98 -z "$spawn_z" 2>&1 | grep -q "An instance of Gazebo is not running."; do\n'
+                 '\t\t\techo "gzserver not ready yet, trying again!"\n'
+                 '\t\t\tsleep 1\n'
+                 '\t\tdone\n'
+                 '\tfi',
+                 'inspection_ros_spawn')
+    replace_once(sitl_run,
+                 '\t\t\twait "$SIM_PID" 2>/dev/null || true\n',
+                 '\t\t\t# inspection_spawn_cleanup_bounded\n'
+                 '\t\t\tsleep 2\n'
+                 '\t\t\tkill -KILL "$SIM_PID" 2>/dev/null || true\n'
+                 '\t\t\twait "$SIM_PID" 2>/dev/null || true\n',
+                 'inspection_spawn_cleanup_bounded')
     replace_once(gazebo_cmake,
                  'option(BUILD_GSTREAMER_PLUGIN "enable gstreamer plugin" ON)',
                  'option(BUILD_GSTREAMER_PLUGIN "enable gstreamer plugin" ON)\n'

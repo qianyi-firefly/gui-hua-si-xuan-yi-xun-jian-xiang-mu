@@ -131,10 +131,23 @@ if [ -x "$(command -v gazebo)" ]; then
 
 	spawn_z=0.83
 	if [ "$model" == "inspection_quad" ]; then spawn_z=0.17; fi
-	while gz model --verbose --spawn-file="${modelpath}/${model}/${model_name}.sdf" --model-name=${model} -x 1.01 -y 0.98 -z "$spawn_z" 2>&1 | grep -q "An instance of Gazebo is not running."; do
-		echo "gzserver not ready yet, trying again!"
-		sleep 1
-	done
+	# inspection_ros_spawn: use the owned ROS service, not Gazebo discovery.
+	if [[ "$model" == "inspection_quad" && "$ROS_VERSION" == "1" ]]; then
+		if ! timeout --signal=TERM --kill-after=5s 60s rosrun gazebo_ros spawn_model -sdf -file "${modelpath}/${model}/${model_name}.sdf" -model "$model" -x 1.01 -y 0.98 -z "$spawn_z"; then
+			echo "Inspection model spawn failed or timed out" >&2
+			kill -TERM "$SIM_PID" 2>/dev/null || true
+			# inspection_spawn_cleanup_bounded
+			sleep 2
+			kill -KILL "$SIM_PID" 2>/dev/null || true
+			wait "$SIM_PID" 2>/dev/null || true
+			exit 1
+		fi
+	else
+		while gz model --verbose --spawn-file="${modelpath}/${model}/${model_name}.sdf" --model-name=${model} -x 1.01 -y 0.98 -z "$spawn_z" 2>&1 | grep -q "An instance of Gazebo is not running."; do
+			echo "gzserver not ready yet, trying again!"
+			sleep 1
+		done
+	fi
 
 	if [[ -n "$HEADLESS" ]]; then
 		echo "not running gazebo gui"

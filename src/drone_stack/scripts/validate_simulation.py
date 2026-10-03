@@ -38,7 +38,10 @@ def wait(predicate, seconds=30):
         time.sleep(.05)
     failure={'passed':False,'reason':'timeout','phase':phase_name() if 'phase' in d else None,
              'error':d['error'].data if 'error' in d else None}
-    if 'truth' in d: failure['truth']=truth().tolist()
+    if 'truth' in d:
+        failure['truth_model_names']=list(d['truth'].name)
+        if 'inspection_quad' in d['truth'].name:
+            failure['truth']=truth().tolist()
     if 'odom' in d: failure['position']=current().tolist()
     output(failure)
     if 'state' in d and d['state'].armed and sys.argv[1]!='land':
