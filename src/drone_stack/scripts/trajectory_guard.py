@@ -66,7 +66,7 @@ class MapConversionCache:
 
 
 def validate_curve(message, occupied, origin, resolution, lower, upper,
-                   wall_budget=.25, node_budget=10000, cpu_budget=.05, stats=None, observed_free=None, curve_window=None):
+                   wall_budget=2.0, node_budget=10000, cpu_budget=.05, stats=None, observed_free=None, curve_window=None):
     begin = time.monotonic()
     cpu_begin = time.thread_time()
     nodes = 0

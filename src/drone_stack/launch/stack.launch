@@ -2,6 +2,12 @@
   <param name="/use_sim_time" value="true"/>
   <arg name="fcu_url" default="udp://:14540@127.0.0.1:14557"/>
   <arg name="gui" default="true"/>
+  <arg name="max_flight_height" default="2.5"/>
+  <param name="/drone/max_flight_height_m" value="$(arg max_flight_height)" type="double"/>
+  <param name="/drone/terminal_approach_distance_m" value="0.8" type="double"/>
+  <param name="/drone/terminal_speed_mps" value="0.2" type="double"/>
+  <param name="/drone/terminal_deceleration_mps2" value="0.4" type="double"/>
+  <param name="/drone/terminal_settle_time_s" value="3.0" type="double"/>
   <!-- Upstream node.launch requires MAVROS unless respawn is enabled. Keep
        its PX4 configuration while allowing an isolated MAVROS exit. -->
   <node pkg="mavros" type="mavros_node" name="mavros" required="false"
@@ -34,6 +40,8 @@
     <param name="require_observed_free" value="true"/>
     <param name="known_execution_horizon_s" value="3.0"/>
   </node>
-  <node pkg="drone_stack" type="safe_global_path.py" name="drone_safe_global_path" output="screen"/>
+  <node pkg="drone_stack" type="safe_global_path.py" name="drone_safe_global_path" output="screen">
+    <param name="max_search_nodes" value="15000"/>
+  </node>
   <node if="$(arg gui)" pkg="drone_stack" type="drone_operator_gui" name="drone_operator_gui" output="screen"/>
 </launch>

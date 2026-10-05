@@ -6,6 +6,19 @@
 namespace ego_planner
 {
 
+  // Cubic uniform B-spline boundaries are fixed during both optimizers.
+  // Pin exact start derivatives and a zero-velocity/acceleration goal instead
+  // of relying on the least-squares parameterizer's endpoint approximation.
+  static void pinTerminalBoundary(Eigen::MatrixXd& q, double dt,
+      const Eigen::Vector3d& start, const Eigen::Vector3d& velocity,
+      const Eigen::Vector3d& acceleration, const Eigen::Vector3d& goal)
+  {
+    q.col(0)=start-velocity*dt+acceleration*dt*dt/3.;
+    q.col(1)=start-acceleration*dt*dt/6.;
+    q.col(2)=start+velocity*dt+acceleration*dt*dt/3.;
+    for (int i=q.cols()-3;i<q.cols();++i) q.col(i)=goal;
+  }
+
   // SECTION interfaces for setup and query
 
   EGOPlannerManager::EGOPlannerManager() {}
@@ -42,7 +55,7 @@ namespace ego_planner
 
   bool EGOPlannerManager::reboundReplan(Eigen::Vector3d start_pt, Eigen::Vector3d start_vel,
                                         Eigen::Vector3d start_acc, Eigen::Vector3d local_target_pt,
-                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj)
+                                        Eigen::Vector3d local_target_vel, bool flag_polyInit, bool flag_randomPolyTraj, bool terminal_stop)
   {
 
     static int count = 0;
@@ -52,7 +65,7 @@ namespace ego_planner
     cout << "start: " << start_pt.transpose() << ", " << start_vel.transpose() << "\ngoal:" << local_target_pt.transpose() << ", " << local_target_vel.transpose()
          << endl;
 
-    if ((start_pt - local_target_pt).norm() < 0.2)
+    if ((start_pt - local_target_pt).norm() < (terminal_stop ? .02 : .2))
     {
       cout << "Close to goal" << endl;
       continous_failures_count_++;
@@ -84,12 +97,31 @@ namespace ego_planner
         if((reference.back()-local_target_pt).norm()>1e-6) reference.push_back(local_target_pt);
         vector<double> arc(reference.size(),0.);
         for(size_t i=1;i<reference.size();++i) arc[i]=arc[i-1]+(reference[i]-reference[i-1]).norm();
-        if(arc.back()<.05) return false;
+        if(arc.back()<(terminal_stop ? .02 : .05)) return false;
         const int samples=std::max(8,std::min(128,int(std::ceil(arc.back()/(pp_.ctrl_pt_dist*.5)))+1));
-        ts=arc.back()/std::max(.1,pp_.max_vel_)/(samples-1);
+        const double duration=terminal_stop ? std::max(1.,1.875*arc.back()/std::max(.1,pp_.max_vel_)) :
+                                               arc.back()/std::max(.1,pp_.max_vel_);
+        ts=duration/(samples-1);
+        // A monotone quintic arc profile slows the real control seed towards
+        // the goal. Geometry still follows the authoritative global curve.
+        double initial_arc_speed=std::max(0.,start_vel.dot((reference[1]-reference[0]).normalized()));
+        PolynomialTraj arc_profile;
+        if (terminal_stop)
+          arc_profile=PolynomialTraj::one_segment_traj_gen(Eigen::Vector3d::Zero(),
+              Eigen::Vector3d(initial_arc_speed,0,0),Eigen::Vector3d::Zero(),
+              Eigen::Vector3d(arc.back(),0,0),Eigen::Vector3d::Zero(),Eigen::Vector3d::Zero(),duration);
+        // The normalized quintic is monotone for v0*T/length <= 2.5.
+        // Reject an infeasible short moving start instead of clipping an
+        // overshooting polynomial into a false stationary reference.
+        if (terminal_stop && initial_arc_speed*duration > 2.5*arc.back()+1e-8) {
+          ROS_WARN_THROTTLE(1.,"Terminal route too short for the current moving boundary");
+          return false;
+        }
         size_t segment=0;
         for(int i=0;i<samples;++i) {
-          const double length=arc.back()*i/(samples-1);
+          double length=arc.back()*i/(samples-1);
+          if (terminal_stop) length=std::max(0.,std::min(arc.back(),arc_profile.evaluate(i*ts).x()));
+          if (i==samples-1) length=arc.back();
           while(segment+1<arc.size()-1 && arc[segment+1]<length) ++segment;
           const double fraction=(length-arc[segment])/std::max(1e-9,arc[segment+1]-arc[segment]);
           point_set.push_back(reference[segment]+fraction*(reference[segment+1]-reference[segment]));
@@ -235,6 +267,7 @@ namespace ego_planner
 
     Eigen::MatrixXd ctrl_pts;
     UniformBspline::parameterizeToBspline(ts, point_set, start_end_derivatives, ctrl_pts);
+    if (terminal_stop) pinTerminalBoundary(ctrl_pts,ts,start_pt,start_vel,start_acc,local_target_pt);
 
     vector<vector<Eigen::Vector3d>> a_star_pathes;
     a_star_pathes = bspline_optimizer_rebound_->initControlPoints(ctrl_pts, true);
@@ -273,7 +306,7 @@ namespace ego_planner
       cout << "Need to reallocate time." << endl;
 
       Eigen::MatrixXd optimal_control_points;
-      flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points);
+      flag_step_2_success = refineTrajAlgo(pos, start_end_derivatives, ratio, ts, optimal_control_points, terminal_stop);
       if (flag_step_2_success)
         pos = UniformBspline(optimal_control_points, 3, ts);
     }
@@ -287,6 +320,14 @@ namespace ego_planner
 
     t_refine = ros::Time::now() - t_start;
 
+    if (terminal_stop) {
+      pos.setPhysicalLimits(pp_.max_vel_,pp_.max_acc_,pp_.feasibility_tolerance_);
+      double final_ratio=1.;
+      if (!pos.checkFeasibility(final_ratio,false)) {
+        ROS_WARN_THROTTLE(1.,"Terminal curve still violates physical limits after refinement");
+        continous_failures_count_++;return false;
+      }
+    }
     double collision_time=0.;
     if (!continuousTrajectoryFree(pos,grid_map_,collision_time,0.05))
     {
@@ -462,14 +503,16 @@ namespace ego_planner
     return true;
   }
 
-  bool EGOPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points)
+  bool EGOPlannerManager::refineTrajAlgo(UniformBspline &traj, vector<Eigen::Vector3d> &start_end_derivative, double ratio, double &ts, Eigen::MatrixXd &optimal_control_points, bool terminal_stop)
   {
     double t_inc;
 
     Eigen::MatrixXd ctrl_pts; // = traj.getControlPoint()
 
     // std::cout << "ratio: " << ratio << std::endl;
+    const Eigen::Vector3d start=traj.evaluateDeBoorT(0.),goal=traj.evaluateDeBoorT(traj.getTimeSum());
     reparamBspline(traj, start_end_derivative, ratio, ctrl_pts, ts, t_inc);
+    if (terminal_stop) pinTerminalBoundary(ctrl_pts,ts,start,start_end_derivative[0],start_end_derivative[2],goal);
 
     traj = UniformBspline(ctrl_pts, 3, ts);
 

@@ -35,5 +35,6 @@
   <exec_depend>python3-numpy</exec_depend>
   <exec_depend>python3-scipy</exec_depend>
   <exec_depend>ego_planner</exec_depend>
+  <depend>plan_env</depend>
   <export/>
 </package>

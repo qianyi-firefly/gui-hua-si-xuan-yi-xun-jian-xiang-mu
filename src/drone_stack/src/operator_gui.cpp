@@ -1,4 +1,9 @@
-#include <drone_stack/LocalGoal.h>
+#include <plan_env/MapArchive.h>
+#include <QFileDialog>
+#include <QDir>
+#include <QLineEdit>
+#include <drone_stack/QueueGoal.h>
+#include <drone_stack/SetMaxFlightHeight.h>
 #include <drone_stack/SetNavigationSpeed.h>
 #include <drone_stack/Takeoff.h>
 #include <geometry_msgs/PointStamped.h>
@@ -30,6 +35,7 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <std_msgs/Bool.h>
+#include <std_msgs/Float64.h>
 #include <std_msgs/Header.h>
 #include <std_msgs/String.h>
 #include <std_srvs/SetBool.h>
@@ -60,6 +66,7 @@
 #include <QPixmap>
 #include <QPushButton>
 #include <QScrollArea>
+#include <QSizePolicy>
 #include <QStringList>
 #include <QSplitter>
 #include <QTimer>
@@ -101,8 +108,19 @@ public:
     cancel_client_ = nh_.serviceClient<std_srvs::Trigger>("/drone/cancel_goal");
     land_client_ = nh_.serviceClient<std_srvs::Trigger>("/drone/land");
     direct_land_client_ = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
-    goal_client_ = nh_.serviceClient<drone_stack::LocalGoal>("/drone/local_goal");
+    goal_client_ = nh_.serviceClient<drone_stack::QueueGoal>("/drone/queue_goal");
     speed_client_ = nh_.serviceClient<drone_stack::SetNavigationSpeed>("/drone/set_navigation_speed");
+    map_archive_client_ = nh_.serviceClient<plan_env::MapArchive>("/drone/map_archive");
+    map_mode_sub_ = nh_.subscribe<std_msgs::String>("/drone/map_mode",1,[this](const std_msgs::String::ConstPtr& m){std::lock_guard<std::mutex> guard(mutex_);map_mode_=QString::fromStdString(m->data);});
+    map_status_sub_ = nh_.subscribe<std_msgs::String>("/drone/map_status",1,[this](const std_msgs::String::ConstPtr& m){std::lock_guard<std::mutex> guard(mutex_);map_status_=QString::fromStdString(m->data);});
+    ceiling_client_ = nh_.serviceClient<drone_stack::SetMaxFlightHeight>("/drone/set_max_flight_height");
+    queue_sub_ = nh_.subscribe<nav_msgs::Path>("/drone/goal_queue", 1, [this](const nav_msgs::Path::ConstPtr& msg) {
+      std::lock_guard<std::mutex> guard(mutex_); queue_message_ = *msg; have_queue_update_ = true;
+    });
+    ceiling_sub_ = nh_.subscribe<std_msgs::Float64>("/drone/max_flight_height", 1, [this](const std_msgs::Float64::ConstPtr& msg) {
+      if (!std::isfinite(msg->data)) return;
+      std::lock_guard<std::mutex> guard(mutex_); ceiling_value_ = msg->data; have_ceiling_update_ = true;
+    });
     state_sub_ = nh_.subscribe("/mavros/state", 5, &OperatorWindow::onState, this);
     odom_sub_ = nh_.subscribe("/mavros/local_position/odom", 5, &OperatorWindow::onOdom, this);
     battery_sub_ = nh_.subscribe("/mavros/battery", 5, &OperatorWindow::onBattery, this);
@@ -239,6 +257,28 @@ private:
       }
       array.markers.push_back(m);
     }
+    const size_t count = queued_points_.size();
+    for (size_t i = 0; i < std::max(count, rendered_queue_count_); ++i) {
+      for (int label = 0; label < 2; ++label) {
+        visualization_msgs::Marker m;
+        m.header.frame_id = "odom"; m.header.stamp = ros::Time::now();
+        m.ns = "operator_goal_queue"; m.id = 2*i + label; m.pose.orientation.w = 1.0;
+        m.action = i < count ? visualization_msgs::Marker::ADD : visualization_msgs::Marker::DELETE;
+        m.color.r = 1.0; m.color.a = 1.0;
+        if (i < count) m.pose.position = queued_points_[i];
+        if (label) {
+          m.type = visualization_msgs::Marker::TEXT_VIEW_FACING; m.scale.z = .32;
+          m.pose.position.z += .35; m.text = std::to_string(i+1);
+        } else {
+          m.type = visualization_msgs::Marker::CYLINDER;
+          m.pose.position.z += .08; m.scale.x = .30; m.scale.y = .30; m.scale.z = .04;
+          // The active point is already drawn by operator_navigation/0.
+          if (i == 0) m.action = visualization_msgs::Marker::DELETE;
+        }
+        array.markers.push_back(m);
+      }
+    }
+    rendered_queue_count_ = count;
     navigation_pub_.publish(array);
   }
 
@@ -299,14 +339,20 @@ private:
       auto* label = new QLabel(key + QStringLiteral("\n--"), root);
       label->setObjectName("card");
       label->setAlignment(Qt::AlignCenter);
-      label->setMinimumHeight(60);
+      label->setFixedHeight(64);
+      label->setWordWrap(true);
+      label->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
       cards->addWidget(label, 1);
       cards_[key] = label;
     }
     main->addLayout(cards);
     telemetry_ = new QLabel(QStringLiteral("等待位姿与飞行状态"), root);
     readiness_ = new QLabel(QStringLiteral("等待系统就绪"), root);
+    telemetry_->setFixedHeight(24);
+    telemetry_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
     readiness_->setWordWrap(true);
+    readiness_->setFixedHeight(40);
+    readiness_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
     main->addWidget(telemetry_);
     main->addWidget(readiness_);
     auto* horizontal = new QSplitter(Qt::Horizontal, root);
@@ -374,6 +420,8 @@ private:
 
     navigation_hint_ = new QLabel(QStringLiteral("红点：目标  |  黄实线：已观测自由  |  黄虚线：待观测参考  |  紫线：执行中的EGO曲线  |  绿线：实际轨迹"), left);
     navigation_hint_->setWordWrap(true);
+    navigation_hint_->setFixedHeight(76);
+    navigation_hint_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
     leftLayout->addWidget(navigation_hint_);
     connect(view3d, &QPushButton::clicked, this, [this] {
       two_d_view_ = false; picking_goal_ = false;
@@ -381,18 +429,21 @@ private:
     });
     connect(view2d, &QPushButton::clicked, this, [this] { picking_goal_ = false; showTopDown(); });
     connect(pickGoal, &QPushButton::clicked, this, [this] {
-      showTopDown(); picking_goal_ = true;
-      log(QStringLiteral("滚轮缩放二维图；左键点选一个目标，Z使用右侧高度。到达或取消前不能发送第二个目标。"));
+      picking_goal_ = !picking_goal_;
+      if (picking_goal_) showTopDown();
+      log(picking_goal_ ? QStringLiteral("连续左键点选目标，按编号依次执行；滚轮缩放，Z使用右侧高度。再次点击按钮结束点选。") : QStringLiteral("已结束点选，现有目标队列继续执行。"));
     });
     horizontal->addWidget(left);
 
     auto* sideScroll = new QScrollArea(horizontal);
     sideScroll->setWidgetResizable(true);
-    sideScroll->setMinimumWidth(355);
-    sideScroll->setMaximumWidth(480);
+    sideScroll->setFixedWidth(420);
+    sideScroll->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    sideScroll->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     auto* side = new QWidget(sideScroll);
     side->setObjectName("side");
     auto* sideLayout = new QVBoxLayout(side);
+    sideLayout->setSizeConstraint(QLayout::SetMinAndMaxSize);
     front_image_ = cameraBox(sideLayout, side, QStringLiteral("前视处理画面 · 仿真目标"));
     down_image_ = cameraBox(sideLayout, side, QStringLiteral("下视处理画面 · 仿真目标"));
     auto* ops = new QGroupBox(QStringLiteral("飞行操作"), side);
@@ -423,18 +474,70 @@ private:
     navigation_speed_->setToolTip(QStringLiteral("下一次导航任务采用此规划速度；当前任务及其重规划保持原速度。"));
     opsLayout->addWidget(new QLabel(QStringLiteral("移动速度 m/s")), 2, 0);
     opsLayout->addWidget(navigation_speed_, 2, 1);
-    opsLayout->addWidget(takeoff, 3, 0, 1, 2);
-    opsLayout->addWidget(hold, 4, 0);
-    opsLayout->addWidget(cancel, 4, 1);
-    opsLayout->addWidget(new QLabel(QStringLiteral("降落按钮位于底部固定操作栏")), 5, 0, 1, 2);
-    opsLayout->addWidget(disarm, 6, 0, 1, 2);
+    maximum_height_ = spin(2.5, ops);
+    maximum_height_->setRange(.8, 2.5); maximum_height_->setSingleStep(.1);
+    maximum_height_->setSuffix(QStringLiteral(" m"));
+    maximum_height_->setToolTip(QStringLiteral("机体中心最高 ENU Z，与点选绝对Z同一基准；规划与目标保留0.20m裕量。可在未解锁地面或无任务的健康HOLD时修改。"));
+    ceiling_button_ = new QPushButton(QStringLiteral("最高Z（ENU）设置"), ops);
+    opsLayout->addWidget(ceiling_button_, 3, 0);
+    opsLayout->addWidget(maximum_height_, 3, 1);
+    opsLayout->addWidget(takeoff, 4, 0, 1, 2);
+    opsLayout->addWidget(hold, 5, 0);
+    opsLayout->addWidget(cancel, 5, 1);
+    opsLayout->addWidget(new QLabel(QStringLiteral("降落按钮位于底部固定操作栏")), 6, 0, 1, 2);
+    opsLayout->addWidget(disarm, 7, 0, 1, 2);
     sideLayout->addWidget(ops);
+    auto* mapping = new QGroupBox(QStringLiteral("建图与预建地图导航"),side);
+    auto* mappingLayout = new QGridLayout(mapping);
+    map_mode_label_ = new QLabel(QStringLiteral("地图模式等待中"),mapping);
+    map_mode_label_->setWordWrap(true);
+    map_mode_label_->setFixedHeight(64);
+    map_mode_label_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
+    mappingLayout->addWidget(map_mode_label_,0,0,1,2);
+    map_file_ = new QLineEdit(QDir::homePath()+QStringLiteral("/robotproject/project0/start/maps/inspection.dmap"),mapping);
+    mappingLayout->addWidget(map_file_,1,0,1,2);
+    auto* browseMap = new QPushButton(QStringLiteral("选择地图文件"),mapping);
+    mappingLayout->addWidget(browseMap,2,0,1,2);
+    connect(browseMap,&QPushButton::clicked,this,[this]{
+      const auto path=QFileDialog::getOpenFileName(this,QStringLiteral("选择预建导航地图"),map_file_->text(),QStringLiteral("导航地图 (*.dmap);;所有文件 (*)"));
+      if(!path.isEmpty())map_file_->setText(path);
+    });
+    map_dx_=spin(0.,mapping);map_dy_=spin(0.,mapping);map_dz_=spin(0.,mapping);map_yaw_=spin(0.,mapping);
+    map_dx_->setRange(-30.,30.);map_dy_->setRange(-30.,30.);map_dz_->setRange(-5.,5.);map_yaw_->setRange(-180.,180.);
+    for(auto* input:{map_dx_,map_dy_,map_dz_})input->setSingleStep(.1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔX m")),3,0);mappingLayout->addWidget(map_dx_,3,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔY m")),4,0);mappingLayout->addWidget(map_dy_,4,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔZ m")),5,0);mappingLayout->addWidget(map_dz_,5,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU yaw °")),6,0);mappingLayout->addWidget(map_yaw_,6,1);
+    auto* mappingNote=new QLabel(QStringLiteral("地图必须与当前ENU对齐；相同仿真起点默认全零。先绕场扫描、落地上锁再保存。加载后仍使用实时雷达避障与Faster-LIO定位。"),mapping);mappingNote->setWordWrap(true);mappingNote->setFixedHeight(80);mappingNote->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);mappingLayout->addWidget(mappingNote,7,0,1,2);
+    const std::vector<std::pair<QString,std::string>> operations={{QStringLiteral("开始新建图"),"new"},{QStringLiteral("保存地图"),"save"},{QStringLiteral("加载地图导航"),"load"},{QStringLiteral("返回在线建图导航"),"online"}};
+    for(size_t i=0;i<operations.size();++i){
+      auto* button=new QPushButton(operations[i].first,mapping);map_buttons_.push_back(button);
+      mappingLayout->addWidget(button,8+int(i)/2,int(i)%2);
+      const auto action=operations[i].second;
+      connect(button,&QPushButton::clicked,this,[this,action]{
+        QString path=map_file_->text();
+        if(action=="save"){
+          QDir().mkpath(QDir::homePath()+QStringLiteral("/robotproject/project0/start/maps"));
+          path=QFileDialog::getSaveFileName(this,QStringLiteral("保存导航地图"),path,QStringLiteral("导航地图 (*.dmap)"));
+          if(path.isEmpty())return;
+          if(!path.endsWith(QStringLiteral(".dmap")))path+=QStringLiteral(".dmap");
+          map_file_->setText(path);
+        }
+        plan_env::MapArchive service;service.request.action=action;service.request.path=path.toStdString();
+        service.request.offset_x=map_dx_->value();service.request.offset_y=map_dy_->value();service.request.offset_z=map_dz_->value();service.request.yaw_deg=map_yaw_->value();
+        if(!map_archive_client_.call(service))log(QStringLiteral("地图服务不可用"));
+        else log(QString::fromStdString(service.response.message));
+      });
+    }
+    sideLayout->addWidget(mapping);
     auto* goals = new QGroupBox(QStringLiteral("局部三维目标 · ROS ENU"), side);
     auto* goalLayout = new QGridLayout(goals);
     relative_x_ = spin(1.0, goals);
     relative_y_ = spin(0.0, goals);
     relative_z_ = spin(0.0, goals);
     clicked_height_ = spin(1.2, goals);
+    clicked_height_->setRange(.5, 2.3);
     goalLayout->addWidget(new QLabel(QStringLiteral("前向 ΔX m")), 0, 0);
     goalLayout->addWidget(relative_x_, 0, 1);
     goalLayout->addWidget(new QLabel(QStringLiteral("左向 ΔY m")), 1, 0);
@@ -446,6 +549,8 @@ private:
     goalLayout->addWidget(sendRelative, 3, 0, 1, 2);
     goalLayout->addWidget(new QLabel(QStringLiteral("点选目标绝对 Z m")), 4, 0);
     goalLayout->addWidget(clicked_height_, 4, 1);
+    queue_status_ = new QLabel(QStringLiteral("剩余目标：0（含当前）"), goals);
+    goalLayout->addWidget(queue_status_, 5, 0, 1, 2);
     sideLayout->addWidget(goals);
     sideLayout->addStretch();
     sideScroll->setWidget(side);
@@ -464,6 +569,7 @@ private:
     events_->setMaximumBlockCount(200);
     events_->setMaximumHeight(110);
     main->addWidget(events_);
+    for(auto* button:root->findChildren<QPushButton*>())button->setFocusPolicy(Qt::NoFocus);
     setCentralWidget(root);
 
     connect(auth, &QPushButton::clicked, this, [this] {
@@ -477,6 +583,13 @@ private:
       trigger(arm_client_, QStringLiteral("解锁"));
     });
     connect(navigation_speed_, &QDoubleSpinBox::editingFinished, this, [this] { configureSpeed(); });
+    connect(ceiling_button_, &QPushButton::clicked, this, [this] {
+      drone_stack::SetMaxFlightHeight srv; srv.request.height_m = maximum_height_->value();
+      if (!ceiling_client_.call(srv)) { log(QStringLiteral("最高高度设置服务不可用")); return; }
+      log(QString::fromStdString(srv.response.message));
+      maximum_height_->setValue(srv.response.height_m);
+      clicked_height_->setMaximum(srv.response.height_m-.20);
+    });
     connect(takeoff, &QPushButton::clicked, this, [this] {
       drone_stack::Takeoff srv;
       srv.request.height_m = takeoff_height_->value();
@@ -517,7 +630,9 @@ private:
     auto* body = new QVBoxLayout(box);
     auto* image = new QLabel(QStringLiteral("等待画面"), box);
     image->setAlignment(Qt::AlignCenter);
-    image->setMinimumHeight(170);
+    image->setFixedHeight(180);
+    // A live pixmap must never participate in layout size negotiation.
+    image->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
     image->setStyleSheet("background:#080d13;color:#8fa0b5;border:1px solid #405067;");
     body->addWidget(image);
     layout->addWidget(box);
@@ -554,22 +669,13 @@ private:
   }
 
   bool submit(const geometry_msgs::PoseStamped& goal) {
-    if (goal_busy_) { log(QStringLiteral("已有目标正在执行，请先到达或取消")); return false; }
     if (!configureSpeed()) return false;
-    goal_busy_ = true; navigation_seen_ = false; goal_start_ = ros::Time::now();
-    selected_goal_ = goal.pose.position; have_target_marker_ = true;
-    planned_path_.clear(); actual_path_.clear(); last_trace_stamp_ = ros::Time(0);
-    { std::lock_guard<std::mutex> guard(mutex_); actual_path_.push_back(odom_.pose.pose.position); goal_navigation_epoch_ = navigation_epoch_; }
-    pick_button_->setEnabled(false); goal_button_->setEnabled(false);
-    publishNavigation();
-    drone_stack::LocalGoal srv; srv.request.goal = goal;
-    if (!goal_client_.call(srv)) {
-      goal_busy_ = false; log(QStringLiteral("目标服务不可用")); return false;
-    }
+    drone_stack::QueueGoal srv; srv.request.goal = goal;
+    if (!goal_client_.call(srv)) { log(QStringLiteral("目标队列服务不可用")); return false; }
     log(QString::fromStdString(srv.response.message));
-    if (!srv.response.success) goal_busy_ = false;
-    else active_goal_pub_.publish(goal);
-    navigation_hint_->setText(srv.response.success ? QStringLiteral("目标已发送，等待规划黄线；执行期间禁止第二个目标。绿线为实际轨迹。") : QStringLiteral("目标被拒绝，可重新点选。红点为本次选择，未开始执行。"));
+    navigation_hint_->setText(srv.response.success ?
+      QStringLiteral("已加入队列，剩余%1个目标；仅规划当前目标，可继续点选。绿线为实际轨迹。").arg(srv.response.queued_count) :
+      QStringLiteral("目标被拒绝，可重新点选；现有队列保持执行。"));
     return srv.response.success;
   }
 
@@ -647,9 +753,13 @@ private:
     mavros_msgs::State state;
     sensor_msgs::BatteryState battery;
     std::string phase, lioQuality;
-    QString error;
+    QString error, mapMode, mapStatus;
+    nav_msgs::Path queue;
+    bool queueUpdate = false, ceilingUpdate = false;
+    double ceiling = 2.5;
     {
       std::lock_guard<std::mutex> guard(mutex_);
+      mapMode=map_mode_;mapStatus=map_status_;
       state = state_; battery = battery_; phase = phase_; odom = odom_;
       front = front_; down = down_; frontStamp = front_stamp_; downStamp = down_stamp_;
       authorized = authorized_; lio = lio_valid_;
@@ -661,6 +771,8 @@ private:
       frontReceipt = front_receipt_; downReceipt = down_receipt_;
       click = have_click_; clicked = pending_click_; have_click_ = false;
       error = pending_error_; pending_error_.clear();
+      queueUpdate = have_queue_update_; queue = queue_message_; have_queue_update_ = false;
+      ceilingUpdate = have_ceiling_update_; ceiling = ceiling_value_; have_ceiling_update_ = false;
     }
     if (!error.isEmpty()) log(error);
     if (!error.isEmpty()) last_error_ = error;
@@ -692,19 +804,47 @@ private:
     state.connected = state.connected && stateFresh;
     const bool flightReady = state.connected && lio && managerFresh && poseFresh;
     auth_button_->setEnabled(state.connected && managerFresh);
-    if (goal_busy_) {
-      { std::lock_guard<std::mutex> guard(mutex_); if (navigation_epoch_ > goal_navigation_epoch_) navigation_seen_ = true; }
-      if ((navigation_seen_ && phase != "NAVIGATING") || !authorized || !state.armed ||
-          !managerFresh || !lio || phase == "LANDING" || phase == "DESCENDING" || phase == "FAILSAFE") {
-        goal_busy_ = false;
-        have_target_marker_ = false;
-        planned_path_.clear(); actual_path_.clear();
-        { std::lock_guard<std::mutex> guard(mutex_); have_global_path_ = false; }
-        publishNavigation();
-        navigation_hint_->setText(QStringLiteral("任务已结束；目标点与路径已清除。可在HOLD重新点选。"));
-      }
+    if (ceilingUpdate) {
+      maximum_height_->setValue(ceiling); clicked_height_->setMaximum(ceiling-.20);
+      maximum_height_->setToolTip(QStringLiteral("当前已生效天花板：%1 m ENU Z；目标及规划上限：%2 m。地面或无任务的健康HOLD时可修改。")
+        .arg(ceiling,0,'f',2).arg(ceiling-.20,0,'f',2));
     }
-    goal_button_->setEnabled(flightReady && authorized && state.armed && phase == "HOLD" && !goal_busy_);
+    if (queueUpdate && queue.header.frame_id == "odom") {
+      const bool wasBusy = goal_busy_;
+      queued_points_.clear();
+      for (const auto& pose : queue.poses) queued_points_.push_back(pose.pose.position);
+      goal_busy_ = !queued_points_.empty(); have_target_marker_ = goal_busy_;
+      if (goal_busy_) {
+        const auto& next = queue.poses.front();
+        const bool changed = !wasBusy || next.header.stamp != goal_start_ ||
+          std::hypot(next.pose.position.x-selected_goal_.x,next.pose.position.y-selected_goal_.y) > 1e-5 ||
+          std::abs(next.pose.position.z-selected_goal_.z) > 1e-5;
+        if (changed) {
+          selected_goal_ = next.pose.position; goal_start_ = next.header.stamp;
+          planned_path_.clear(); active_goal_pub_.publish(next);
+          if (!wasBusy) { actual_path_.clear(); last_trace_stamp_ = ros::Time(0); }
+        }
+      } else {
+        planned_path_.clear(); actual_path_.clear(); last_trace_stamp_ = ros::Time(0);
+        navigation_hint_->setText(QStringLiteral("队列已结束；目标与路径已清除，可继续点选。"));
+      }
+      queue_status_->setText(QStringLiteral("剩余目标：%1（含当前）").arg(queued_points_.size()));
+      publishNavigation();
+    }
+    if (goal_busy_ && (!authorized || !state.armed || !managerFresh ||
+        phase == "LANDING" || phase == "DESCENDING" || phase == "FAILSAFE")) {
+      goal_busy_ = false; have_target_marker_ = false; queued_points_.clear();
+      planned_path_.clear(); actual_path_.clear(); publishNavigation();
+      queue_status_->setText(QStringLiteral("剩余目标：0（任务中止）"));
+    }
+    goal_button_->setEnabled(flightReady && authorized && state.armed &&
+                            (phase == "HOLD" || phase == "NAVIGATING") && queued_points_.size() < 100);
+    ceiling_button_->setEnabled(state.connected && managerFresh &&
+                               (!state.armed || (flightReady && phase == "HOLD" && !goal_busy_)));
+    map_mode_label_->setText(QStringLiteral("%1\n%2").arg(mapMode=="PRIOR_NAV"?QStringLiteral("预建地图导航"):mapMode=="MAPPING"?QStringLiteral("在线建图导航"):QStringLiteral("地图模式等待中"),mapStatus));
+    map_mode_label_->setToolTip(mapStatus);
+    const bool mapEditable=flightReady && !state.armed && phase=="READY" && lioQuality=="HEALTHY";
+    for(auto* button:map_buttons_)button->setEnabled(mapEditable);
     arm_button_->setEnabled(flightReady && authorized && !state.armed && phase == "READY");
     takeoff_button_->setEnabled(flightReady && authorized && state.armed && phase == "ARMED");
     const bool canHold = flightReady && state.armed &&
@@ -713,10 +853,9 @@ private:
     land_button_->setEnabled(state.connected && state.armed);
     disarm_button_->setEnabled(state.connected && managerFresh && state.armed && phase == "ARMED");
     auth_button_->setText(authorized ? QStringLiteral("撤销授权") : QStringLiteral("操作授权"));
-    pick_button_->setEnabled(goal_button_->isEnabled() && !click);
+    pick_button_->setEnabled(picking_goal_ || (goal_button_->isEnabled() && !click));
+    pick_button_->setText(picking_goal_ ? QStringLiteral("结束连续点选") : QStringLiteral("点选XY目标"));
     if (click && picking_goal_) {
-      picking_goal_ = false;
-      manager_->getToolManager()->setCurrentTool(manager_->getToolManager()->getDefaultTool());
       if (!goal_button_->isEnabled()) {
         log(QStringLiteral("系统状态不允许导航，点选目标未发送"));
       } else {
@@ -752,7 +891,7 @@ private:
     }
     QString globalStatus, navigationWait;
     { std::lock_guard<std::mutex> guard(mutex_); globalStatus = global_status_; navigationWait = navigation_wait_; }
-    if (goal_busy_) navigation_hint_->setText(QStringLiteral("红点：目标 | 黄实线：已观测自由 | 黄虚线：待观测参考 | 紫线：执行中的EGO曲线 | 绿线：实际轨迹\n") + navigationWait + QStringLiteral("\n") + globalStatus);
+    if (goal_busy_) navigation_hint_->setText(QStringLiteral("红点编号：执行顺序（剩余%1个） | 黄线：当前目标路线 | 紫线：执行中的EGO曲线 | 绿线：实际轨迹\n").arg(queued_points_.size()) + navigationWait + QStringLiteral("\n") + globalStatus);
     if (goal_busy_ && poseFresh && odom.header.stamp > last_trace_stamp_) {
       const auto& p = odom.pose.pose.position;
       if (actual_path_.empty() || std::hypot(p.x-actual_path_.back().x,p.y-actual_path_.back().y)>.02 || std::abs(p.z-actual_path_.back().z)>.02) {
@@ -831,6 +970,7 @@ private:
     else if (phase == "HOLD" || phase == "NAVIGATING") reason = QStringLiteral("可发送局部目标、悬停或一键降落");
     else reason = QStringLiteral("当前阶段：") + QString::fromStdString(phase);
     readiness_->setText(reason);
+    readiness_->setToolTip(reason);
     for (auto* button : {auth_button_, arm_button_, takeoff_button_, hold_button_, cancel_button_, goal_button_, pick_button_, disarm_button_})
       button->setToolTip(button->isEnabled() ? QString() : reason);
     land_button_->setToolTip(QStringLiteral("已连接且已解锁时可请求降落；管理器不可用时直接请求 PX4 AUTO.LAND"));
@@ -871,9 +1011,9 @@ private:
     setCardColor("雷达/EGO", cloudFresh && mapFresh ? CardColor::Green : CardColor::Red);
     setCardColor("双相机", frontFresh && downFresh ? CardColor::Green : CardColor::Red);
     setCardColor("告警", alarmActive ? CardColor::Red : CardColor::Green);
-    if (frontFresh && !front.isNull()) front_image_->setPixmap(QPixmap::fromImage(front).scaled(front_image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    if (frontFresh && !front.isNull()) front_image_->setPixmap(QPixmap::fromImage(front).scaled(front_image_->contentsRect().size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     else front_image_->setText(QStringLiteral("前视画面等待中"));
-    if (downFresh && !down.isNull()) down_image_->setPixmap(QPixmap::fromImage(down).scaled(down_image_->size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
+    if (downFresh && !down.isNull()) down_image_->setPixmap(QPixmap::fromImage(down).scaled(down_image_->contentsRect().size(), Qt::KeepAspectRatio, Qt::SmoothTransformation));
     else down_image_->setText(QStringLiteral("下视画面等待中"));
   }
 
@@ -886,8 +1026,24 @@ private:
   std::string lio_quality_ = "UNKNOWN";
   ros::Subscriber cloud_sub_, map_sub_, heartbeat_sub_, state_sub_, odom_sub_, battery_sub_, lio_sub_, phase_sub_, auth_sub_, error_sub_, front_sub_, down_sub_, clicked_sub_;
   ros::ServiceClient auth_client_, arm_client_, takeoff_client_, hold_client_, cancel_client_, land_client_, goal_client_;
+  ros::ServiceClient map_archive_client_;
+  ros::Subscriber map_mode_sub_,map_status_sub_;
+  QString map_mode_,map_status_;
+  QLabel* map_mode_label_=nullptr;
+  QLineEdit* map_file_=nullptr;
+  QDoubleSpinBox *map_dx_=nullptr,*map_dy_=nullptr,*map_dz_=nullptr,*map_yaw_=nullptr;
+  std::vector<QPushButton*> map_buttons_;
   ros::ServiceClient direct_land_client_;
-  ros::ServiceClient speed_client_;
+  ros::ServiceClient speed_client_, ceiling_client_;
+  ros::Subscriber queue_sub_, ceiling_sub_;
+  nav_msgs::Path queue_message_;
+  bool have_queue_update_ = false, have_ceiling_update_ = false;
+  double ceiling_value_ = 2.5;
+  std::vector<geometry_msgs::Point> queued_points_;
+  size_t rendered_queue_count_ = 0;
+  QLabel* queue_status_ = nullptr;
+  QPushButton* ceiling_button_ = nullptr;
+  QDoubleSpinBox* maximum_height_ = nullptr;
   std::mutex mutex_;
   mavros_msgs::State state_;
   nav_msgs::Odometry odom_;

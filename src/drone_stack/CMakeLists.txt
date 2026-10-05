@@ -3,13 +3,13 @@ project(drone_stack)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_AUTOMOC ON)
 find_package(catkin REQUIRED COMPONENTS
-  geometry_msgs message_generation mavros_msgs nav_msgs roscpp rviz
+  plan_env geometry_msgs message_generation mavros_msgs nav_msgs roscpp rviz
   sensor_msgs std_srvs visualization_msgs
 )
 find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
-add_service_files(FILES Takeoff.srv LocalGoal.srv SetNavigationSpeed.srv)
+add_service_files(FILES Takeoff.srv LocalGoal.srv SetNavigationSpeed.srv QueueGoal.srv SetMaxFlightHeight.srv)
 generate_messages(DEPENDENCIES geometry_msgs)
-catkin_package(CATKIN_DEPENDS geometry_msgs mavros_msgs nav_msgs roscpp rviz sensor_msgs std_srvs visualization_msgs message_runtime)
+catkin_package(CATKIN_DEPENDS plan_env geometry_msgs mavros_msgs nav_msgs roscpp rviz sensor_msgs std_srvs visualization_msgs message_runtime)
 include_directories(${catkin_INCLUDE_DIRS})
 add_executable(drone_operator_gui src/operator_gui.cpp)
 add_dependencies(drone_operator_gui ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})

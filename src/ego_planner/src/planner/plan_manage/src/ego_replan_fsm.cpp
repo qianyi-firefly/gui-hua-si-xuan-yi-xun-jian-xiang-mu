@@ -1,6 +1,7 @@
 #include <plan_manage/ego_replan_fsm.h>
 #include <cmath>
 #include <limits>
+#include <stdexcept>
 
 namespace ego_planner
 {
@@ -19,6 +20,15 @@ namespace ego_planner
     nh.param("fsm/planning_horizon", planning_horizen_, -1.0);
     nh.param("fsm/planning_horizen_time", planning_horizen_time_, -1.0);
     nh.param("fsm/emergency_time_", emergency_time_, 1.0);
+    nh.param("/drone/terminal_approach_distance_m", terminal_distance_, .8);
+    nh.param("/drone/terminal_speed_mps", terminal_speed_, .2);
+    nh.param("/drone/terminal_deceleration_mps2", terminal_deceleration_, .4);
+    nh.param("/drone/terminal_settle_time_s", terminal_settle_time_, 3.);
+    if (!std::isfinite(terminal_distance_) || terminal_distance_ < .3 || terminal_distance_ > 2. ||
+        !std::isfinite(terminal_speed_) || terminal_speed_ < .1 || terminal_speed_ > .3 ||
+        !std::isfinite(terminal_deceleration_) || terminal_deceleration_ <= 0. || terminal_deceleration_ > .5 ||
+        !std::isfinite(terminal_settle_time_) || terminal_settle_time_ < 1. || terminal_settle_time_ > 5.)
+      throw std::runtime_error("Invalid terminal approach parameters");
 
     nh.param("fsm/waypoint_num", waypoint_num_, -1);
     for (int i = 0; i < waypoint_num_; i++)
@@ -92,6 +102,7 @@ namespace ego_planner
     prepared_start_=false;
     clearLocalPlan();
     route_points_.clear(); route_stamp_=ros::Time(0);
+    terminal_approach_=false;terminal_entry_planned_=false;
     if (!req.enabled) { reply.success=true; reply.message="Previous local curve cleared"; return true; }
     const auto &p=req.goal.pose.position;
     const double age=(ros::Time::now()-odom_stamp_).toSec();
@@ -101,6 +112,7 @@ namespace ego_planner
         !std::isfinite(req.speed_mps) || req.speed_mps<.1 || req.speed_mps>1.) {
       reply.success=false; reply.message="Invalid goal, speed or stale start odometry"; return true;
     }
+    navigation_speed_=req.speed_mps;
     planner_manager_->setNavigationSpeed(req.speed_mps);
     ros::param::set("/ego_planner_node/manager/max_vel",req.speed_mps);
     ros::param::set("/ego_planner_node/optimization/max_vel",req.speed_mps);
@@ -424,10 +436,28 @@ namespace ego_planner
 
       Eigen::Vector3d pos = info->position_traj_.evaluateDeBoorT(t_cur);
 
-      /* && (end_pt_ - pos).norm() < 0.5 */
+      // Replan once on entry, before the normal near-goal no-replan branch.
+      // Use route arc distance, so a nearby goal across an obstacle is not
+      // mistaken for a short final approach.
+      const double approach_distance=std::max(terminal_distance_,
+          navigation_speed_*navigation_speed_/(2*terminal_deceleration_)+.3);
+      if (use_global_route_ && !terminal_entry_planned_ &&
+          remainingRouteDistance(pos) <= approach_distance &&
+          t_cur < info->duration_ - .1) {
+        terminal_approach_=true;terminal_entry_planned_=true;
+        have_new_target_=true;
+        ROS_INFO("Entering terminal approach; remaining arc %.3f m",remainingRouteDistance(pos));
+        changeFSMExecState(REPLAN_TRAJ,"TERMINAL_APPROACH");return;
+      }
       if (t_cur > info->duration_ - 1e-2)
       {
-        if (use_global_route_ && (end_pt_-odom_pos_).norm()>.2) {
+        // Let the controller settle on the actual zero-speed final spline.
+        // The manager still checks arrival and current tracking safety.
+        if (terminal_approach_ && (pos-end_pt_).norm()<=.02 &&
+            info->velocity_traj_.evaluateDeBoorT(info->duration_).norm()<=.03 &&
+            (time_now-info->start_time_).toSec()<info->duration_+terminal_settle_time_)
+          return;
+        if (use_global_route_ && ((end_pt_-odom_pos_).norm()>.15 || odom_vel_.norm()>.15)) {
           have_new_target_=true;
           changeFSMExecState(GEN_NEW_TRAJ,"ROUTE_CONTINUE");
           return;
@@ -561,7 +591,9 @@ namespace ego_planner
     if (!getLocalTarget()) return false;
 
     bool plan_success =
-        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
+        planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_,
+            (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj,
+            terminal_approach_ && (local_target_pt_-end_pt_).norm()<.01);
     have_new_target_ = false;
 
     cout << "final_plan_success=" << plan_success << endl;
@@ -757,6 +789,25 @@ namespace ego_planner
     if (!installRoute(msg->path)) route_points_.clear();
   }
 
+  double EGOReplanFSM::remainingRouteDistance(const Eigen::Vector3d& position) const
+  {
+    if (route_points_.size()<2 || route_stamp_.isZero() ||
+        (ros::Time::now()-route_stamp_).toSec() < -.02 ||
+        (ros::Time::now()-route_stamp_).toSec() > 2.) return std::numeric_limits<double>::infinity();
+    size_t segment=0;double gap=std::numeric_limits<double>::infinity();Eigen::Vector3d projection;
+    for (size_t i=0;i+1<route_points_.size();++i) {
+      const Eigen::Vector3d d=route_points_[i+1]-route_points_[i];
+      if (d.squaredNorm()<1e-12) continue;
+      const double u=std::max(0.,std::min(1.,(position-route_points_[i]).dot(d)/d.squaredNorm()));
+      const Eigen::Vector3d q=route_points_[i]+u*d;
+      if ((q-position).norm()<=gap+1e-8) {gap=(q-position).norm();segment=i;projection=q;}
+    }
+    if (!std::isfinite(gap) || gap>.75) return std::numeric_limits<double>::infinity();
+    double remaining=gap;Eigen::Vector3d from=projection;
+    for (size_t i=segment+1;i<route_points_.size();++i) {remaining+=(route_points_[i]-from).norm();from=route_points_[i];}
+    return remaining;
+  }
+
   bool EGOReplanFSM::getRouteTarget()
   {
     const double age=(ros::Time::now()-route_stamp_).toSec();
@@ -774,6 +825,14 @@ namespace ego_planner
       if(gap<=best+1e-8) {best=gap;segment=i;projection=q;}
     }
     if(best>.75) {ROS_WARN_THROTTLE(1.,"Planning start too far from unified route");return false;}
+    const double approach_distance=std::max(terminal_distance_,
+        navigation_speed_*navigation_speed_/(2*terminal_deceleration_)+.3);
+    const double arc_distance=remainingRouteDistance(start_pt_);
+    if (arc_distance <= approach_distance) terminal_approach_=true;
+    // Retain the current boundary speed while braking. Reducing the velocity
+    // limit below it would make a continuous start boundary infeasible.
+    const double speed=terminal_approach_ ? std::min(navigation_speed_,std::max(terminal_speed_,start_vel_.norm())) : navigation_speed_;
+    planner_manager_->setNavigationSpeed(speed);
     double remaining=planning_horizen_;Eigen::Vector3d from=projection;
     bool stop=false;Eigen::Vector3d end_tangent=Eigen::Vector3d::Zero();
     vector<Eigen::Vector3d> seed;seed.push_back(start_pt_);
@@ -794,7 +853,7 @@ namespace ego_planner
     }
     auto map=planner_manager_->grid_map_;
     if(!map->isInMap(local_target_pt_) || map->getInflateOccupancy(local_target_pt_)!=0) return false;
-    if((local_target_pt_-start_pt_).norm()<.1 || seed.size()<2) return false;
+    if((local_target_pt_-start_pt_).norm()<(terminal_approach_ && stop ? .02 : .1) || seed.size()<2) return false;
     planner_manager_->route_seed_=std::move(seed);
     local_target_vel_=stop?Eigen::Vector3d::Zero().eval():(end_tangent*planner_manager_->pp_.max_vel_).eval();
     geometry_msgs::PoseStamped target;target.header.frame_id="odom";target.header.stamp=ros::Time::now();

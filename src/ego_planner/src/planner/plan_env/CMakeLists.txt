@@ -11,6 +11,8 @@ find_package(OpenCV REQUIRED)
 
 find_package(catkin REQUIRED COMPONENTS
   roscpp
+  message_generation
+  mavros_msgs
   rospy
   std_msgs
   visualization_msgs
@@ -18,35 +20,39 @@ find_package(catkin REQUIRED COMPONENTS
   message_filters
 )
 
+add_service_files(FILES MapArchive.srv)
+generate_messages()
+
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.7 REQUIRED)
 
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES plan_env
- CATKIN_DEPENDS roscpp std_msgs
+ CATKIN_DEPENDS roscpp std_msgs mavros_msgs message_runtime
 #  DEPENDS system_lib
 )
 
-include_directories( 
-    SYSTEM 
-    include 
+include_directories(
+    SYSTEM
+    include
     ${catkin_INCLUDE_DIRS}
-    ${Eigen3_INCLUDE_DIRS} 
+    ${Eigen3_INCLUDE_DIRS}
     ${PCL_INCLUDE_DIRS}
     ${OpenCV_INCLUDE_DIRS}
 )
 
 link_directories(${PCL_LIBRARY_DIRS})
 
-add_library( plan_env 
-    src/grid_map.cpp 
+add_library( plan_env
+    src/grid_map.cpp
     src/raycast.cpp
     )
+add_dependencies(plan_env ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries( plan_env
-    ${catkin_LIBRARIES} 
+    ${catkin_LIBRARIES}
     ${PCL_LIBRARIES}
-    )  
+    )
 
 # Explicit offline regression target; not part of normal simulator startup.
 add_executable(map_message_offline_test EXCLUDE_FROM_ALL tests/map_message_offline_test.cpp)

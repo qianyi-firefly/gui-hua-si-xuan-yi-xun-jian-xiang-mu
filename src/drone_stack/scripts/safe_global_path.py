@@ -13,7 +13,7 @@ import rospy
 from geometry_msgs.msg import PoseStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2
-from std_msgs.msg import String
+from std_msgs.msg import String, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from ego_planner.msg import Bspline, GlobalRoute
@@ -53,13 +53,16 @@ class SafeGlobalPath:
                      rospy.get_param('/ego_planner_node/grid_map/ground_height',.5)]
         self.res=rospy.get_param('/ego_planner_node/grid_map/resolution',.1)
         self.shape=[math.ceil(rospy.get_param('/ego_planner_node/grid_map/map_size_'+a,s)/self.res) for a,s in zip('xyz',[30.,30.,8.])]
-        self.lower=[-8.,-8.,.5]; self.upper=[8.,8.,2.5]; self.step=.25
+        self.lower=[-8.,-8.,.5]; self.upper=[8.,8.,float(rospy.get_param('/drone/max_flight_height_m',2.5))-.20]; self.step=.25
+        self.max_search_nodes=int(rospy.get_param("~max_search_nodes",15000))
+        if not 1000 <= self.max_search_nodes <= 60000:raise ValueError("Invalid global search node limit")
         self.geometry=SimpleNamespace(map_origin=self.origin,map_resolution=self.res)
         self.pub=rospy.Publisher('/drone/global_path',Path,queue_size=1,latch=True)
         self.progress_pub=rospy.Publisher('/drone/global_route_progress',String,queue_size=1,latch=True)
         self.route_pub=rospy.Publisher('/drone/global_route',GlobalRoute,queue_size=1,latch=True)
         self.marker_pub=rospy.Publisher('/drone/global_path_markers',MarkerArray,queue_size=1,latch=True)
         self.status=rospy.Publisher('/drone/global_path_status',String,queue_size=1,latch=True)
+        rospy.Subscriber('/drone/max_flight_height',Float64,self.on_ceiling,queue_size=1)
         rospy.Subscriber('/drone/navigation_goal',PoseStamped,self.on_goal,queue_size=1)
         rospy.Subscriber('/drone/flight_state',String,self.on_phase,queue_size=5)
         rospy.Subscriber('/drone/navigation_stage',String,self.on_stage,queue_size=1)
@@ -69,6 +72,16 @@ class SafeGlobalPath:
         rospy.Subscriber('/grid_map/observed_free',PointCloud2,self.on_free,queue_size=1,buff_size=8*1024*1024,tcp_nodelay=True)
         rospy.Subscriber('/grid_map/occupancy_inflate_safety',PointCloud2,self.on_map,queue_size=1,buff_size=8*1024*1024,tcp_nodelay=True)
         threading.Thread(target=self.run,daemon=True).start()
+
+    def on_ceiling(self,message):
+        if not math.isfinite(message.data) or not .8<=message.data<=2.5:return
+        with self.lock:
+            height=message.data-.20
+            if abs(self.upper[2]-height)<1e-8:return
+            self.upper[2]=height;self.generation+=1;self.search=None
+            self.reference_route=[];self.reference_progress=0.;self.progress_pose=None
+            self.route_version+=1
+            if self.goal is not None:self.clear('最高飞行高度已更新，重新计算受限路线')
 
     def clear(self,reason):
         self.path=[]; self.path_complete=False; self.publish([],reason)
@@ -139,7 +152,8 @@ class SafeGlobalPath:
             self.stage=m.data
             if self.stage!='TRACKING':
                 self.curve=None;self.curve_epoch=rospy.Time.now();self.route_curve_id=None
-                self.search=None # Restart from the held position, retaining a safe line.
+                # Same-task waiting/ACK transitions preserve A* progress.
+                # Goal, ceiling and displacement changes invalidate it separately.
 
     def on_odom(self,m):
         if m.header.frame_id!='odom' or (rospy.Time.now()-m.header.stamp).to_sec()<-.02:return
@@ -215,7 +229,7 @@ class SafeGlobalPath:
                     if self.segment_safe(start,p,cells):
                         c=math.dist(start,p);cost[i]=c;parent[i]=None;heapq.heappush(queue,(c+math.dist(p,goal),c,i))
         expanded=0
-        while queue and expanded<10000:
+        while queue and expanded<self.max_search_nodes:
             if time.thread_time()-batch>=.025:
                 yield None
                 batch=time.thread_time()

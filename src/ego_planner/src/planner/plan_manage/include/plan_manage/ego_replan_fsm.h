@@ -60,6 +60,9 @@ namespace ego_planner
     int waypoint_num_;
     double planning_horizen_, planning_horizen_time_;
     double emergency_time_;
+    double navigation_speed_{0.5}, terminal_distance_{0.8}, terminal_speed_{0.2}, terminal_deceleration_{0.4}, terminal_settle_time_{3.0};
+    bool terminal_approach_{false}, terminal_entry_planned_{false};
+    double remainingRouteDistance(const Eigen::Vector3d&) const;
 
     /* planning data */
     bool trigger_, have_target_, have_odom_, have_new_target_;

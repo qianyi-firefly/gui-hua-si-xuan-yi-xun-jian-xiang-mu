@@ -10,7 +10,13 @@
 #include <nav_msgs/Odometry.h>
 #include <std_msgs/String.h>
 #include <queue>
+#include <unordered_set>
+#include <plan_env/MapArchive.h>
+#include <mavros_msgs/State.h>
+#include <mavros_msgs/ExtendedState.h>
+#include <nav_msgs/Path.h>
 #include <ros/ros.h>
+#include <std_msgs/Float64.h>
 #include <tuple>
 #include <visualization_msgs/Marker.h>
 
@@ -197,6 +203,19 @@ private:
   MappingParameters mp_;
   MappingData md_;
   bool cloud_memory_started_ = true;
+  std::unordered_set<int> navigation_cells_;
+  ros::ServiceServer map_archive_service_;
+  ros::Publisher map_mode_pub_, map_archive_status_pub_;
+  ros::Subscriber archive_state_sub_, archive_landed_sub_, archive_phase_sub_, archive_health_sub_, archive_queue_sub_;
+  bool archive_armed_ = true, archive_connected_ = false;
+  int archive_landed_ = 0;
+  std::string archive_phase_, archive_health_, archive_mode_ = "MAPPING";
+  ros::WallTime archive_state_time_, archive_landed_time_, archive_phase_time_, archive_health_time_;
+  size_t archive_queue_size_ = 0;
+  bool mapArchiveCallback(plan_env::MapArchive::Request& request, plan_env::MapArchive::Response& response);
+  void rebuildCloudInflation();
+  void publishArchiveMode(const std::string& detail);
+  ros::Subscriber max_height_sub_;
   ros::Subscriber cloud_memory_start_sub_;
   void cloudMemoryStartCallback(const std_msgs::StringConstPtr& state);
 

@@ -1,3 +1,170 @@
+## 2026-10-05 本轮终点/地图残留/初始位姿需求已记录，尚未修改
+
+- 首点终点问题已定位：sim126.492距目标10.6cm进入确认，sim127.39距15.0000205cm速度仅0.0094m/s，硬15cm门槛失效，127.408重规划、机头反向至-132.32度，132.126才到达。需要确认阶段滞回和安全末端控制，不能通过放宽最终到达容差掩盖。
+- 地图有射线清除和膨胀引用扣减；原始占据残留、射线覆盖/回波保护带、FCU/LIO逐帧配准与Qt历史显示均需区分。尚未证明具体根因，不得写成无实时更新。初始位姿建议map/odom显式对齐、Qt地图初始位置/朝向设置，并保持控制ENU及飞控内部连续。
+- 分析建议start/qt_work/lio_diagnosis_20261005_202824/three_issue_review.md。用户已选择：在线自动设起点；预建地图手动点位置并拖动朝向。当前飞机已手动降落上锁，后台诊断仍在运行。没有控制或算法修改。
+
+## 2026-10-05 20:28 定位异常复现实验版本重启完成，只读诊断持续记录
+
+- 按用户指令，重启前新鲜确认connected=true、armed=false、landed_state1；停止上一轮launcher2221110、Qt2221186、gzclient2222031。新日志start/logs/20261005_202841；launcher2222913、Qt2222991、manager2223096、global2223099、EGO2223050、LIO2223035、gzserver2223360、gzclient2223864。
+- sim65.050地面READY/HEALTHY、connected=true、armed=false、AUTO.LOITER、landed_state1；2秒曲线墙钟预算及30约束阈值保持，导航/健康策略没有修改，没有自动飞行。
+- 新只读监测start/qt_work/lio_diagnosis_20261005_202824（current_manual_observer），monitor2223884、reference_observer2223885、cloud_diagnostic2223886。记录几何三特征值/匹配数、定位与真值/实际朝向/轨迹队列/健康和黄线出现；额外每约1墙钟秒记录原始与适配点数、距离/机体坐标方向分布、三套位姿。弱约束时每5墙钟秒最多30帧压缩原始点云，限制数据量；不发布任何控制/真值输入。
+- ground_alignment_baseline.json保存地面三套坐标初始对齐基准；真值world与LIO/FCU ENU原点不同，不能直接相减称漂移。具体弱方向/环境表面需复现后基于捕获帧进一步分析。现在等待用户手动相近点实验，监测后台持续，进程/deployment/pids/startup_ready均已保存。
+
+## 2026-10-05 20:25 本轮第一点完成，下一点规划被几何健康保护中止（只分析）
+
+- 第一目标[5.758,6.407,1.2]于sim150.562 / 20:21:45.063完成。近终点最弱平移约束反复低于30，区域采样最低23.226、匹配仍459点以上，没有雷达停发证据。
+- 下一点派发要求HEALTHY；sim152.082 / 20:21:50.087恢复，152.128开始下一点。因此实际约5.08墙钟秒等待主要是健康恢复门槛，不是全程A*计算。随后154.522取消任务HOLD，155.014降落，20:22:15落地上锁。下一点没有规划ACK记录；未记录精确全局搜索扩展及黄色路线首次发布时刻，不能断言已成功算出第二点完整路线或耗尽15000节点。
+- 当前LOCALIZING/SEVERE、armed=false、landed_state1。几何分数已恢复约69，但bridge.pose_fault在连续弱约束1.012仿真秒后锁定，停止外部位姿输出，需重启恢复；没有自动解除锁定。没有改程序、重启或发送控制。
+- 证据start/qt_work/wall_budget_2s_restart/first_goal_health_incident.json及本轮ROS节点/stack日志。几何弱约束具体对应哪个表面尚未取证，不应称定位跳变或雷达损坏。
+
+## 2026-10-05 20:13 按用户指令重启完成，2秒轨迹校验墙钟限制已部署
+
+- 重启前新鲜FCU状态确认connected=true、armed=false、landed_state=1；停止旧launcher2217592、Qt2219809、Gazebo客户端2218504及本轮只读观察2220076/2220077，旧ROS/PX4/Gazebo退出后启动新完整程序。
+- 当前日志start/logs/20261005_201347，launcher2221110、Qt2221186、管理器2221276、gzserver2221543、gzclient2222031。纯Python改动无需C++编译，新管理器加载trajectory_guard.py的wall_budget=2.0；CPU0.05秒、校验10000节点及其他保护保持。
+- sim65.104只读启动状态READY/HEALTHY、connected=true、armed=false、AUTO.LOITER、landed_state=1、map_mode=MAPPING；全局节点上限15000。Qt/Gazebo进程均在线，没有发送ARM/起飞/导航命令。旧轮监测已停止，尚未开启新飞行监测。
+- 证据start/qt_work/wall_budget_2s_restart/{deployment.json,startup_ready.json,launcher.log,gzclient.log}；原pending.json已标记runtime_applied=true。本次验证为地面启动，未做飞行实验。
+
+## 2026-10-05 用户指定曲线校验墙钟上限改为2秒，源码完成待重启生效
+
+- trajectory_guard.py validate_curve默认wall_budget由0.25改为2.0；flight_manager完整曲线与执行前瞻均使用该默认值。线程CPU预算0.05秒与递归10000节点上限保持，全局参考显式0.15/0.5秒预算保持，未改变碰撞/体积/新鲜度/超时后取消策略。
+- Python AST及git diff --check通过；纯Python改动无需C++编译。当前运行管理器2217793已经导入旧默认值，尚未应用2秒；当前飞机仍HOLD、armed=true、Z约1.87m，不能通过空中重启管理器中断OFFBOARD。落地上锁后按用户重启指令部署；Qt无需为此重编译。没有发送飞行指令或改变运行参数。
+
+## 2026-10-05 当前手动三点导航被整段曲线墙钟预算取消
+
+- 用户重新起飞后HOLD高度约1.90m，低起点问题已消失；sim334.448提交首点[5.654,6.068,1.2]并连续排入3点。全局完整路线与EGO新会话ACK均已生成，机头对准后新曲线id2在sim337.390触发完整轨迹校验超预算，进入HOLD并清空3点队列；当前armed=true、OFFBOARD、HEALTHY，无自动降落。
+- /tmp/drone_ros_home/log/70463b98-c0b2-11f1-b884-a1c2669bfe23/drone_flight_manager-16.log第161行记录wall=0.2514s、threadCPU=0.0059s、nodes=10；命中0.25s墙钟限制，而非0.05s CPU或10000校验节点限制。高调度等待/抢占是可疑原因，尚未进一步取调度证据；预算耗尽不能证明轨迹碰撞或LIO漂移。该预算独立于全局A*15000。
+- 证据start/qt_work/manual_map_modes_20261005_195912/trajectory_validation_wall_timeout.json及原始logs/reference_observer。Qt按空队列清线源于取消，未到达。只分析和保存，没有修改参数/代码，后台观察继续运行。
+
+## 2026-10-05 本轮手动实验发现起点高度低于规划范围
+
+- 监测已记录TAKEOFF→HOLD→NAVIGATING；用户提交两个1.2m高目标[5.468,5.894]和[3.959,-3.603]。当前sim313.034实际ENU Z=0.12656226754188538，低于全局/管理器默认最低Z0.5m，规划起点落在允许飞行体积之外，六邻域A*无法连接可用起点，黄色完整路径为空。此原因与15000节点预算无关，定位仍HEALTHY。
+- 证据start/qt_work/manual_map_modes_20261005_195912/low_start_height.json和telemetry/events；只分析和记录，没有调整高度参数、发送导航/降落命令或重启。建议用户先取消导航并降落，上锁后设置相对起飞高度1.2m重新起飞再测试；原相对起飞高度可调最小0.2m与导航最低绝对Z0.5m的兼容性需后续单独修改。
+
+## 2026-10-05 19:59 地图模式版本手动实验监测已接入
+
+- 仿真继续start/logs/20261005_194642，Qt2219809，未重启或修改控制。监测目录start/qt_work/manual_map_modes_20261005_195912，monitor2220076、reference_observer2220077，current_manual_observer指向本轮。
+- 接入sim270.998时已TAKEOFF、armed=true、OFFBOARD、HEALTHY，地图模式MAPPING，地图状态“已清除旧地图，开始在线建图”；队列为空。PX4日志已记录Takeoff detected。本次只读监测，没有发送ARM/起飞/导航/地图切换指令。
+- 记录地图模式/存取状态、队列、终点阶段、实际位置/速度/目标距离、全局路径、真实EGO曲线边界与紫线同源、实际朝向相对有向切线、健康/几何约束、OFFBOARD间隔、FCU/LIO/真值。没有录整幅点云/图像/rosbag；监测后台持续运行，后续需结合最新日志判断。
+
+## 2026-10-05 Qt右侧自动放大/移动布局修复，仅重启Qt
+
+- 相机QLabel原按自身size缩放图片后setPixmap，默认sizeHint再参与滚动内容的高度/宽度协商，存在持续撑大布局的反馈；动态多行状态文字也改变布局。现相机固定180px高度、QSizePolicy::Ignored/Fixed并按contentsRect绘制，右侧固定420px宽、垂直滚动条常驻；状态卡/就绪提示/导航提示/地图模式说明固定高度，长文提供tooltip，避免刷新改变控件位置。
+- 操作按钮NoFocus，避免点击或健康状态使按钮启停时焦点自动跳到输入框/滚动位置；原ARM显式焦点留在操作组逻辑保留。右栏仍支持手动滚动。
+- catkin_make drone_operator_gui -j1 -l1编译退出0、git diff --check通过。停止旧Qt2217671，单独启动新Qt2219809；仿真/管理器未重启（launcher2217592、管理器2217793、gzserver2218011），没有飞行控制指令。Qt为独立进程组，后续完整重启时还应按PID/命令核对停止该Qt。
+- 界面已打开并查看截图qt_after.png，READY、定位有效、未解锁、相机/体素在线，尺寸正常。证据start/qt_work/map_modes_20261005/ui_fix含build.log、deployment.json及前后截图；before抓图因窗口被覆盖显示桌面，不能作为布局变化测量。当前部署指纹已更新Qt源码与二进制；未执行额外自动GUI测试或飞行实验。
+
+## 2026-10-05 15000节点与Qt地图模式版本已编译部署，地面启动通过
+
+- 重启前只读确认sim917.810 armed=false，sim919.010 landed_state1；旧仿真launcher2210827、gzclient2211755及只读观察2211751/2211752均已停止。
+- catkin_make -j1 -l1编译退出0，地图后端、规划器、Qt均通过；日志start/qt_work/map_modes_20261005/build.log。已重启start/logs/20261005_194642，launcher2217592、Qt2217671、EGO2217725、管理器2217793、全局路径2217801、Gazebo客户端2218504；地图服务类型plan_env/MapArchive在线，max_search_nodes=15000，map_mode=MAPPING。
+- Python AST、launch/package XML、git diff --check及部署源码/二进制指纹核对通过，Qt/Gazebo窗口存在；sim65.120只读确认READY/HEALTHY、connected=true、armed=false、AUTO.LOITER、landed_state1、map_mode=MAPPING、max_search_nodes=15000；地面启动检查通过，startup_ready.json与Qt/Gazebo截图已保存。本轮只编译/启动，没有调用地图切换/保存/加载服务进行测试，不自动ARM或飞行实验。地图存取和飞行效果仍需用户手动验证。
+
+- 当前部署指纹、编译日志、启动状态与截图位于start/qt_work/map_modes_20261005；current_feature_deployment指向该目录。旧manual_terminal_retry只读观察已停止，新一轮飞行未启动。工作区改动未提交或推送GitHub。
+
+## 2026-10-05 15000节点与Qt地图模式改造：源码完成，待落地后编译部署
+
+- 用户要求提高节点至15000，新增建图保存、预建地图导航并同步Qt。已写入全局max_search_nodes参数15000，保留同任务PLANNING/SPACE_WAIT阶段切换的A*搜索，完整全局路径等待45秒、管理器ACK窗口50秒墙钟；其余体积/碰撞/目标代次保护保留。
+- plan_env新增MapArchive.srv及/drone/map_archive服务，action=new/save/load/online；保存完整记忆原始占据证据与已观测自由体素，含网格/ENU元数据的.dmap稀疏存档，临时写入后原子替换；加载先校验全部记录，再重建当前膨胀与天花板。实时射线仍更新/清除占据。
+- 导航/Qt体素发布改为稀疏已知单元集合，覆盖完整记忆和加载范围，不局限当前扫描窗口；动态维护膨胀引用与自由空间集合。存档不保存膨胀/虚拟天花板，避免重复膨胀。
+- Qt右侧增加地图模式/状态、地图路径、文件选择、ENU dx/dy/dz/yaw校准及开始新建图、保存地图、加载地图导航、返回在线建图导航；存取/切换限定地面未解锁、READY/HEALTHY/空队列。加载不自动重定位，不改善Faster-LIO几何约束，必须与当前ENU正确对齐。非零yaw或非整格平移的历史自由空间不导入，占据按变换体素包络保守栅格化。
+- Python AST/launch和package XML及git diff格式检查通过；直接cmake -S src -B build配置生成退出0（证据start/qt_work/map_modes_20261005/configure_final.log），尚未C++编译、部署或飞行验证，不得把源码当成已运行功能。当前仍旧版本start/logs/20261005_185449，飞机空中armed=true、landed_state2、HOLD（最新sim688.076），没有停止或修改运行控制。
+- 已向用户说明并通过异步输入工具请求手动降落上锁，收到落地未解锁状态后再停止旧launcher2210827、gzclient2211755及monitor2211751/2211752；单任务编译降低内存占用，再重启Qt和仿真并只读检查READY。用户此轮未授权自动飞行，不自动执行飞行验收。新的service需要plan_env消息生成依赖与drone_stack对plan_env依赖，编译时继续排查。
+
+## 2026-10-05 最后目标黄色路径缺失，只读诊断确认搜索预算与重试冲突
+
+- 本轮前三目标到达；第三点[5.284,-4.946,1.2]于sim197.370完成，最后点[-5.433,2.731,1.2]于197.670启动，目标距机体约13.2m。后续反复PLANNING/SPACE_WAIT，错误Unified global route not available yet；定位HEALTHY、目标保留，OFFBOARD悬停流持续。
+- 管理器等待完整全局路径15秒墙钟，超时进入2秒仿真SPACE_WAIT再重试；全局on_stage对每个非TRACKING阶段变化将search=None，长搜索的已探索状态反复丢失。A*分批CPU预算0.025秒、循环sleep0.1秒、六邻域，节点上限10000。
+- 当前地图只读离线复算：起点/目标均安全，直连线被障碍挡住；原10000扩展上限用3.617CPU秒/143批后退出无路结果。隔离诊断副本仅把扩展上限改成60000，未修改源码/运行节点/飞行命令，10602扩展后找到4折点路径，并按原平滑/碰撞算法生成350点完整曲线，证明有安全可行路线。实时15秒等待及10000上限足以阻碍发布。
+- 证据start/qt_work/manual_terminal_retry_20261005_185449/last_goal_readonly_diagnosis.json；本轮只分析，没有修复或部署。后续方案：保留同任务悬停重试的搜索状态；优化/增加搜索预算并把搜索进度纳入等待判定，维持碰撞安全检查。飞行监测仍后台运行。
+
+## 2026-10-05 18:54 用户要求重新启动并手动复试
+
+- 前一轮第一点在接近终点时最低位置观测支持连续低于30，sim1745.700 WARNING、1746.238 HOLD取消6点队列、1746.750 LANDING、1750.810落地上锁；触发前目标误差约0.0227m、速度0.243m/s，没有满足速度与1秒到达条件。终点样条id7精确末端与速度/加速度全零已记录，但收敛被健康保护打断，不能判通过。证据manual_terminal_20261005_185111/incident_first_goal_health.json。
+- 按用户要求只读确认armed=false、landed_state=1后停止旧仿真launcher2207394及只读监测2210240/2210243；保持源码和参数，重启完整仿真与Qt，并开启新轮独立监测。
+- 当前仿真日志start/logs/20261005_185449；launcher2210827、Qt2210900、管理器2211031、EGO2210956、FasterLIO2210937、Gazebo客户端2211755。只读监测目录start/qt_work/manual_terminal_retry_20261005_185449，monitor2211751、reference_observer2211752，最新指针current_manual_observer。
+- 启动状态已保存于本轮startup_status.json：sim65.028，阶段READY、健康HEALTHY、飞控{'connected': True, 'armed': False, 'mode': 'AUTO.LOITER'}，落地状态{'landed_state': 1}。不自动ARM、起飞或导航，后续由用户手动操作；监测保留持续后台记录。
+
+## 2026-10-05 18:51 用户手动终点收敛实验监测启动
+
+- 不重启、不修改控制、不发送飞行指令。仿真继续start/logs/20261005_174011，监测目录start/qt_work/manual_terminal_20261005_185111，monitor PID2210240、reference_observer PID2210243。
+- 接入sim1729.156时已NAVIGATING/TRACKING/HEALTHY，队列6个1.2m高目标：约[5.974,6.546]、[6.200,-6.873]、[-6.357,-6.648]、[-6.034,6.449]、[2.520,-0.261]、[3.424,-4.035]。第一点任务sim1721.746开始，接入前部分需从原始stack日志补充。
+- 持续采集终点阶段/管理器内部阶段、10Hz实际位置/速度/目标距离、队列、健康、几何约束、OFFBOARD目标间隔、FCU/LIO/真值、实际批准样条端点及末端速度/加速度、紫线同源与真实切线朝向。未录整幅点云/图像/rosbag。
+- 此记录是监测开始，不是实验完成或验收通过。监测为后台只读进程，停止/总结时重新检查最新日志。
+
+## 2026-10-05 终点接近与收敛已编译部署，待手动飞行验证
+
+- 已补齐管理器统一到达检查：在OFFBOARD、地图与目标占据安全门之后、规划/等待/转向提前返回之前检查原15cm三维球、0.15m/s和连续1秒；确认期间冻结测得的悬停位置及实际yaw，失效旧规划代次，拒绝旧曲线/指令覆盖，离开容差再规划。正常到达保留后续队列。
+- EGO按剩余全局弧长进入默认0.8m接近阶段，按制动距离扩大；末段0.2m/s目标速度与0.4m/s²减速度参数，保留运动起始边界，五次弧长时间轮廓、精确样条终点及零末端速度/加速度；重分配后再次检查物理可行性。拒绝非单调短距离运动边界。终点规划和路线种子下限统一为0.02m，其余普通短轨迹门槛保持。
+- EGO与管理器共用3秒末端收敛窗口，避免末段刚结束就立即补规划。仅跟踪已批准样条的真实零速度终点，最新地图、跟踪距离、体积、视野与方向限制仍检查；超时回到保守等待/重规划。不会按5cm误差向量触发转向，也不制造显示专用路径。
+- 新增latched状态/drone/navigation_terminal_stage；Qt其他操作保持。末端样条取值缓存减少重复构造。`catkin_make -j2 -l2`最终编译退出0，Python AST、launch XML、diff格式及部署源码/二进制指纹核对通过。
+- 本轮未飞行：重启前只读确认connected=true、armed=false、landed_state=1，然后停止旧launcher2199255及gzclient2200161以编译部署。本次不宣称飞行验收通过；用户手动实验仍需验证短末段、弯道末端、等待/转向进入到达范围、顺序队列与取消。
+- 修改与构建证据目录：start/qt_work/terminal_convergence_20261005。此前规划检查超预算、Qt失败状态保留等未选方案仍未修改。历史“尚未开始管理器修改”记录只代表上一次保存时状态。
+
+- 当前运行：`start/logs/20261005_174011`；launcher PID2207394、Qt PID2207468、管理器PID2207604、EGO PID2207525、Gazebo客户端PID2208289。sim65.128只读确认READY/HEALTHY、connected=true、armed=false、AUTO.LOITER、landed_state=1，终点状态IDLE；Qt/Gazebo窗口、双相机/点云/体素正常，未发飞行指令。部署指纹与启动结果见证据目录deployment.json、startup_ready.json，构建日志build_final.log。
+- 实现备份：`start/checkpoints/terminal_convergence_implemented_latest.tar.gz`；保存进度后重新打包当前未提交改动，未推送GitHub。下一步由用户手动飞行并观察终点收敛是否减少SPACE_WAIT与重复转向，不能将本轮地面启动检查算作飞行通过。
+
+## 2026-10-05 终点收敛改造进行中：用户要求保存并暂停
+
+### 当前状态
+
+- 用户最新授权范围：增加“终点接近与收敛”、提前减速与平稳停止；等待/规划/转向期间都检查到达。仍保持三维球半径15cm、速度<=0.15m/s、连续1秒，碰撞/已观测自由空间/±60度朝向及健康保护保持。
+- **只完成EGO侧第一轮源码修改，尚未编译、尚未部署、尚未飞行验证；管理器修改尚未开始。** 用户额度不足要求先保存，到此暂停实施。
+- 当前运行仍是`start/logs/20261005_163410`对应的连续朝向/天花板/多点队列版本，launcher PID2199255、Qt PID2199336、Gazebo客户端PID2200161。最后手动实验已落地上锁；只读观察PID2200755/2200756已停止。恢复时重新核对实时状态，再决定部署，禁止把在磁盘上的半成品当作当前已运行功能。
+- 修改前GitHub基线89e79fa2c65abfe8bb13a7bbac7802d170a7a8a3，当前工作区还包含该基线之后先前功能与报告，均未提交/推送。本次备份覆盖所有当前改动文件和未跟踪服务/报告。
+
+### 本轮已写入的源码（待审查、编译）
+
+1. `src/drone_stack/launch/stack.launch`添加共享参数：终点接近距离0.8m、末段速度0.2m/s、减速度0.4m/s²。
+2. `ego_replan_fsm.h/.cpp`：计算到终点的剩余全局曲线弧长，避免隔障碍的近距离误判；按制动距离扩大接近距离，接近入口主动触发一次真实EGO重规划；末段速度限制保留当前起始速度以确保制动连续性；末端0.15m与0.15m/s条件；短末段目标允许>=0.02m。
+3. `planner_manager.h/.cpp`：`reboundReplan`与`refineTrajAlgo`加terminal_stop参数（默认false）；只有终点收敛轨迹将原0.20m拒绝阈值降低到0.02m。沿真实全局几何曲线用五次弧长时间轮廓初始化末段；固定三次样条起点位姿/速度/加速度，末三控制点精确设为目标，从而终点位置精确、速度/加速度为零；时间重分配后的优化同样恢复精确边界。沿用完整连续碰撞检查，不生成独立显示轨迹。
+
+### 下一次必须继续的工作
+
+1. 审查EGO第一轮改动：五次弧长轮廓在较大起始速度与极短距离时是否单调/物理可行（当前采样夹到单调长度并不能代替可行性验证）；检查固定边界在时间重分配后是否还满足速度/加速度上限、接口签名和头文件；terminal_entry_planned标记与重复会话/替换路线的关系。不要因未编译而声称功能完成。
+2. 修改`flight_manager.py`：将到达判断移动到NAVIGATING的OFFBOARD/地图/目标障碍安全门之后、PLANNING/SPACE_WAIT/TURNING等提前返回之前；全部内部阶段统一计时，取消begin_heading_alignment对到达计时的无条件重置。到达确认时冻结已测得的到达位置/当前实际yaw、继续发送OFFBOARD悬停；防止规划回调在1秒确认期间覆盖状态。任务切换/取消正确清理计时，正常到达继续保留并分派剩余队列。
+3. 完成管理器“接近/收敛”状态（可独立terminal_stage字段/话题，避免直接更名TRACKING影响全局节点现有分支），与EGO末段匹配。在终点曲线结束后，如果末端确实是目标、当前到目标跟踪段通过最新障碍/自由空间/体积检查，可短时持续跟踪同一批准样条零速度末端以让位置控制收敛；设置有界收敛时间，失败才重新规划，避免直接进入通用2秒SPACE_WAIT。若需要新轨迹或超出安全视野，仍由真实EGO曲线与原保护处理；不要重新引入5cm位置误差方向触发转向。
+4. 到达检查与回调并发/序列失效要保持30Hz目标连续性；检查goal_reached_since存在时旧样条/旧ACK不会取消已稳定的到达，位置离开容差或健康安全门失效应正确处理。
+5. 完成后编译、语法检查与进度说明；用户本轮没有要求自动飞行，不自动起飞。仅在确认落地未解锁后部署/重启供手动实验，若需飞行验证等待相应授权。原“前向校验超预算取消”、Qt异常提示、未来时钟警告等其他方案本轮未选，不擅自加入。
+
+### 保存位置
+
+- 工作区所有源码已落盘，进度文件为本文件。
+- 本次源码备份：`start/checkpoints/terminal_convergence_wip_20261005_172434.tar.gz`；对应目录包含git_diff.patch、保存元数据和源码校验和。该压缩包是相对Git基线的工作中修改文件集合，不含完整依赖或新编译产物。
+- 最新本轮备份链接：`start/checkpoints/terminal_convergence_wip_latest.tar.gz`，独立于历史完整仿真检查点。
+- 实验复盘：docs/simulation/2026-10-05/queue_yaw_experiment_review.md、queue_yaw_experiment_metrics.json；原始手动数据start/qt_work/manual_queue_yaw_20261005_164041。
+
+## 2026-10-05 手动两组多点实验结束复盘，等待用户补充方案
+
+- 用户已结束实验；只读观察PID2200755/2200756已停止，仿真/Qt保留。最后已记录READY、未解锁；降落来自用户sim370.844，375.820 READY。
+- 两组三点共6项，5项完成；最后项前向校验超预算取消。第二组第二点50.444仿真秒，仅18.798秒TRACKING，3次SPACE_WAIT、2次TURNING；终点等待/重规划问题确认。277次紫线同源采样误差0，参考进度无回退；最小几何约束201.61，无健康HOLD/SEVERE。最高实际Z1.586m、最后项全局参考最高Z2.075m，天花板2.5m未调整，尚未完整验收。
+- 完整证据/方案：docs/simulation/2026-10-05/queue_yaw_experiment_review.md，统计queue_yaw_experiment_metrics.json；原始数据start/qt_work/manual_queue_yaw_20261005_164041。问题包含终点收敛、转向前后曲线一致性及曲率限速、检查缓存/线程与三态结果、Qt异常状态保留诊断、黄色参考安全前段、少量未来时钟样本处理。
+- 本次只分析日志、保存报告及停止只读观察，没有修改控制源代码、参数或启动新飞行。方案等待用户补充。
+
+## 2026-10-05 16:50:43 手动队列实验最后一项安全检查超预算取消
+
+- 第一组三点全部完成；第二组前两点完成，最后目标[-5.894250,0.524309,1.2]执行中sim328.012前向可执行曲线检查返回`Full EGO trajectory validation exceeded its bounded budget; executable lookahead`，管理器取消任务、进入HOLD、清空队列；Qt据空队列删除红点和绿线，规划节点删除黄线，执行曲线清空紫线。用户见到目标/线路消失的直接原因已确认。
+- 取消后距最终目标约5.19m，未到达；仍armed=true、悬停，未触发降落。该错误证明计算预算保护触发，不能证明轨迹碰撞或LIO失效。检查限额为wall0.25s/threadCPU0.05s/10000节点，本次错误没有记录具体越界项。
+- 详细事件`start/qt_work/manual_queue_yaw_20261005_164041/cancellation_328012.json`，原始events/reference_audit/telemetry继续记录。仅分析，没有修改控制代码或发送指令。后续需分析前向检查耗时并区分故障取消与到达在Qt的显示提示。
+
+## 2026-10-05 16:41 用户手动多点实验只读监测已启动
+
+- 仿真继续`start/logs/20261005_163410`，不重启、不修改控制程序、不发送飞行指令。
+- 记录目录`start/qt_work/manual_queue_yaw_20261005_164041`，monitor PID2200755、reference_observer PID2200756；持续记录队列/天花板、健康、几何约束、OFFBOARD间隔、FCU/LIO/真值、全局进度、真实紫色曲线与样条一致性，以及实际/指令朝向相对同一执行样条切线的偏差。样条缓存仅保留32条，未录整张点云/图像/rosbag。
+- 监测接入时已NAVIGATING/TRACKING，用户已提交三个1.2m高目标：[3.298058,-0.000580]、[5.100377,-2.527462]、[1.710939,-5.134988]。第一点开始sim171.856，早于监视接入sim185.866；更早的详细轨迹不能凭本次CSV还原，原始stack/PX4日志仍保留。初始最高Z为2.5m。
+- 该节是持续观察起点，不是最终验收结论；后续读取目录事件和采样给出结果。参考观察日志可能出现两个线程的JSON对象紧邻在同一行，分析时用JSONDecoder.raw_decode逐个解析；reference_audit.jsonl单次写入不受打印交错影响。
+
+## 2026-10-05 连续朝向、可调最高高度、多点顺序队列已部署
+
+- 用户请求的三项改动已实现：机头在移动中按获准执行的真实EGO样条有向XY切线连续跟随，最多30度/秒；保留起步悬停对准和超出±60度后的刹停转向；不使用位置误差方向。低水平速度/纯垂直段保留上一朝向。
+- Qt右侧飞行操作新增“最高Z（ENU）设置”，0.8～2.5 m、默认2.5 m；相对起飞高度仍独立。最高高度是机体中心绝对ENU Z，与点选Z同基准。起飞终点、全局路线、整段EGO批准曲线、执行点均受设置值减0.20 m裕量限制；实际超过上限0.05 m时触发降落保护。未解锁地面或无队列的健康OFFBOARD HOLD可更改，禁止降到当前高度加0.20 m以下。动态修改清除旧虚拟天花板整个平面，按真实障碍膨胀引用计数恢复该层占据，再加入新层，防止合成障碍残留。
+- `/drone/queue_goal`接收连续目标，管理器最多保存100点（含当前）；Qt持续点选、红点编号和剩余数量，第二个及以后不发布给全局/EGO规划。当前点到达原15cm/0.15m/s容差并保持1秒后移除；HOLD过渡0.30秒后重新验证最新地图，再发布/规划下一点。未知区域可加入，已知膨胀障碍拒绝；下一点新发现被占据时取消剩余队列并HOLD。取消、悬停、降落、健康HOLD取消均清空队列，包括两个目标之间HOLD窗口内的健康异常。
+- 黄色全局路线、紫色真实控制曲线只对应当前目标；排队点之间不生成显示专用路线。绿色实际轨迹保留到整次队列结束，最后完成清空。再次点击“结束连续点选”只是退出点选模式，不取消已排队任务。相对目标也加入同一队列，旧`/drone/local_goal`接口保留。
+- 已通过`catkin_make -j2 -l2`编译、Python AST语法、launch XML解析、`git diff --check`。最终源码/二进制指纹、编译日志、界面截图和只读启动结果位于`start/qt_work/yaw_ceiling_queue_final_20261005_163410`。初次启动检查发现旧天花板残留风险后补修并重新编译/部署，初次运行不是最终版本。
+- 最终运行`start/logs/20261005_163410`；launcher PID2199255，Gazebo客户端PID2200161。READY/HEALTHY已在sim70.228确认，connected=true、armed=false、landed_state1，队列为空；Qt与Gazebo窗口正常，两个新增service类型已确认。旧只读监视PID2191192/2191193已停止；本轮没有发授权、ARM、起飞或导航指令，没有执行自动飞行实验。
+- 本轮为实现、编译与地面启动检查，**没有飞行验收结果**。下一步由用户手动测试弯道中连续朝向、低天花板下绕柱、连续多点顺序执行和中途取消。此前末段曲线结束后的SPACE_WAIT补规划、转向后新曲线方向变化问题尚未新增专用收敛/一致性机制，不能宣称终点停转全部解决。
+- 运行说明见`src/drone_stack/README.md`新增章节。GitHub基线仍为89e79fa2c65abfe8bb13a7bbac7802d170a7a8a3、tag baseline-20261005-before-yaw-terminal-fix；本轮新增代码尚未提交或推送。
+
 ## 2026-10-05 GitHub修改前基线保存
 
 - 按用户要求保存当前全部程序改动、配置和进度到origin/main，并建立baseline-20261005-before-yaw-terminal-fix标签，供后续修改前回退。

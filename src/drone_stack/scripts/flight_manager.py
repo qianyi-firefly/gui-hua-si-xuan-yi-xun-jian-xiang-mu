@@ -7,6 +7,7 @@ import sys
 import threading
 import time
 import copy
+from types import SimpleNamespace
 import numpy as np
 from itertools import combinations
 
@@ -25,10 +26,10 @@ from ego_planner.msg import Bspline, DataDisp, GlobalRoute
 from ego_planner.srv import StartPlanning, StartPlanningRequest
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from trajectory_guard import validate_curve, PackedCells, MapConversionCache
-from std_msgs.msg import Bool, String, Header
+from std_msgs.msg import Bool, String, Header, Float64
 from std_srvs.srv import SetBool, SetBoolResponse, Trigger, TriggerResponse
 
-from drone_stack.srv import (SetNavigationSpeed, SetNavigationSpeedResponse, LocalGoal, LocalGoalResponse, Takeoff,
+from drone_stack.srv import (SetNavigationSpeed, SetNavigationSpeedResponse, QueueGoal, QueueGoalResponse, SetMaxFlightHeight, SetMaxFlightHeightResponse, LocalGoal, LocalGoalResponse, Takeoff,
                              TakeoffResponse)
 
 
@@ -100,10 +101,30 @@ class FlightManager:
         self.heading_tolerance = math.radians(10.0)
         self.goal_reached_since = None
         self.goal_arrival_pose = None
+        self.terminal_stage = 'IDLE'
+        self.terminal_approach_distance = float(rospy.get_param('/drone/terminal_approach_distance_m', .8))
+        self.terminal_deceleration = float(rospy.get_param('/drone/terminal_deceleration_mps2', .4))
+        self.terminal_settle_time = float(rospy.get_param('/drone/terminal_settle_time_s', 3.0))
+        if (not math.isfinite(self.terminal_approach_distance) or not .3 <= self.terminal_approach_distance <= 2. or
+                not math.isfinite(self.terminal_deceleration) or not 0 < self.terminal_deceleration <= .5 or
+                not math.isfinite(self.terminal_settle_time) or not 1. <= self.terminal_settle_time <= 5.):
+            raise ValueError('Invalid terminal convergence parameters')
+        self.terminal_last_curve_id = None
+        self.terminal_curve_cache = None
         self.goal_tolerance = rospy.get_param('~goal_tolerance_m', 0.15)
         self.goal_speed_tolerance = rospy.get_param('~goal_speed_tolerance_mps', 0.15)
         self.goal_min = rospy.get_param('~goal_min_xyz', [-8.0, -8.0, 0.5])
         self.goal_max = rospy.get_param('~goal_max_xyz', [8.0, 8.0, 2.5])
+        self.configured_max_height = self.goal_max[2]
+        self.ceiling_margin = .20
+        self.max_flight_height = float(rospy.get_param('/drone/max_flight_height_m', self.configured_max_height))
+        if not .8 <= self.max_flight_height <= self.configured_max_height:
+            raise ValueError('Virtual ceiling must be between 0.8 m and configured maximum')
+        self.goal_max[2] = self.max_flight_height-self.ceiling_margin
+        self.goal_queue = []
+        self.queue_dispatch_after = None
+        self.max_queue_points = 100
+        self.yaw_last_tick = rospy.Time(0)
         self.max_takeoff_height = rospy.get_param('~max_takeoff_height_m', 2.0)
         self.map_resolution = rospy.get_param('/ego_planner_node/grid_map/resolution', 0.1)
         self.map_origin = [-rospy.get_param('/ego_planner_node/grid_map/map_size_x',30.0)/2,
@@ -146,6 +167,9 @@ class FlightManager:
         self.setpoint_pub = rospy.Publisher('/mavros/setpoint_raw/local', PositionTarget, queue_size=1,
                                            tcp_nodelay=True)
         self.goal_pub = rospy.Publisher('/move_base_simple/goal', PoseStamped, queue_size=5)
+        self.terminal_stage_pub = rospy.Publisher('/drone/navigation_terminal_stage', String, queue_size=1, latch=True)
+        self.queue_pub = rospy.Publisher('/drone/goal_queue', Path, queue_size=1, latch=True)
+        self.ceiling_pub = rospy.Publisher('/drone/max_flight_height', Float64, queue_size=1, latch=True)
         self.executed_path_pub = rospy.Publisher('/drone/executed_local_path', Path, queue_size=1, latch=True)
         self.local_display_curve = None
         self.local_display_samples = None
@@ -184,11 +208,16 @@ class FlightManager:
         rospy.Service('/drone/land', Trigger, self.land)
         rospy.Service('/drone/rotate_once', Trigger, self.rotate_once)
         rospy.Service('/drone/local_goal', LocalGoal, self.local_goal)
+        rospy.Service('/drone/queue_goal', QueueGoal, self.queue_goal)
+        rospy.Service('/drone/set_max_flight_height', SetMaxFlightHeight, self.set_max_flight_height)
         rospy.Service('/drone/set_navigation_speed', SetNavigationSpeed, self.set_navigation_speed)
         self.planner_client = rospy.ServiceProxy('/planning/start', StartPlanning)
         self.arm_client = rospy.ServiceProxy('/mavros/cmd/arming', CommandBool)
         self.mode_client = rospy.ServiceProxy('/mavros/set_mode', SetMode)
         self.suspend_planner()
+        self.publish_goal_queue()
+        self.terminal_stage_pub.publish(String(data=self.terminal_stage))
+        self.ceiling_pub.publish(Float64(data=self.max_flight_height))
         self.auth_pub.publish(Bool(data=False))
         rospy.Subscriber('/clock', Clock, self.on_clock, queue_size=1, tcp_nodelay=True)
         threading.Thread(target=self.planner_worker, daemon=True).start()
@@ -258,7 +287,7 @@ class FlightManager:
                 # The global route is authoritative for both display and EGO.
                 # Wait outside the flight timer lock; cancellation invalidates
                 # the serial while held setpoints continue at 30 Hz.
-                deadline=time.monotonic()+15.
+                deadline=time.monotonic()+45.
                 with self.planner_condition:
                     while serial==self.planner_serial and not self.route_ready(goal) and time.monotonic()<deadline:
                         self.planner_condition.wait(.1)
@@ -531,12 +560,14 @@ class FlightManager:
                 return 'Trajectory segment enters unobserved space'
         return ''
 
-    def stop_navigation(self, reason, hold_pose=None):
+    def stop_navigation(self, reason, hold_pose=None, preserve_queue=False):
+        if not preserve_queue:
+            self.clear_goal_queue()
         health_grace = (self.airborne() and not self.clock_fault and not self.lio_severe and
                         self.lio_quality != 'SEVERE' and self.state.connected and
                         (self.health_fault_since is None or
                          (rospy.Time.now()-self.health_fault_since).to_nsec()/1e9 < 1.0))
-        response = self.hold(None, health_override=health_grace)
+        response = self.hold(None, health_override=health_grace, preserve_queue=preserve_queue)
         if response.success:
             if hold_pose is not None:
                 self.hold_pose = hold_pose
@@ -605,6 +636,8 @@ class FlightManager:
 
     def on_spline(self, msg):
         with self.lock:
+            if self.navigation_stage == 'ARRIVAL_CONFIRM':
+                return
             # Generation comes from a fresh source spline, never from an old
             # trajectory server refreshing its endpoint command timestamp.
             now = rospy.Time.now()
@@ -699,6 +732,8 @@ class FlightManager:
 
     def check_executable_prefix(self, msg):
         with self.lock:
+            if self.navigation_stage == 'ARRIVAL_CONFIRM':
+                return False
             if self.phase == 'NAVIGATING' and self.navigation_stage in ('TURNING', 'SPACE_WAIT', 'PLANNING'):
                 return False
             self.activate_pending_spline()
@@ -741,6 +776,8 @@ class FlightManager:
 
     def accept_command(self, msg):
         with self.lock:
+            if self.navigation_stage == 'ARRIVAL_CONFIRM':
+                return
             if self.phase == 'NAVIGATING' and self.navigation_stage in ('TURNING', 'SPACE_WAIT', 'PLANNING'):
                 return
             if (msg.trajectory_flag != PositionCommand.TRAJECTORY_STATUS_READY or
@@ -804,6 +841,8 @@ class FlightManager:
                 return TakeoffResponse(success=False, message='Invalid state or takeoff height')
             self.hold_pose = self.copy_pose()
             self.takeoff_pose = self.copy_pose()
+            if self.hold_pose.position.z+request.height_m > self.goal_max[2]:
+                return TakeoffResponse(False, 'Takeoff target exceeds virtual ceiling safety margin')
             self.takeoff_pose.position.z += request.height_m
             self.takeoff_start_z = self.hold_pose.position.z
             self.takeoff_start = rospy.Time.now()
@@ -820,10 +859,12 @@ class FlightManager:
             except rospy.ServiceException as exc:
                 return TriggerResponse(success=False, message=str(exc))
 
-    def hold(self, _request, health_override=False):
+    def hold(self, _request, health_override=False, preserve_queue=False):
         with self.lock:
             if not self.airborne() or self.odom is None or (not health_override and not self.fresh_pose()):
                 return TriggerResponse(success=False, message='Hold requires airborne vehicle and valid position')
+            if not preserve_queue:
+                self.clear_goal_queue()
             self.suspend_planner()
             self.trajectory = None
             self.pending_spline = None
@@ -832,6 +873,8 @@ class FlightManager:
             self.required_trajectory_id = self.latest_command_id + 1
             self.pending_goal = None
             self.active_goal = None
+            self.goal_arrival_pose = None
+            self.set_terminal_stage('IDLE')
             self.navigation_stage = 'WAITING'
             self.navigation_heading_ready = False
             self.goal_reached_since = None
@@ -845,7 +888,7 @@ class FlightManager:
             if self.lio_quality != 'HEALTHY':
                 return TriggerResponse(success=False, message='Rotation requires healthy LIO geometry')
             if (not self.authorized or not self.airborne() or not self.fresh_pose() or
-                    self.phase != 'HOLD' or self.state.mode != 'OFFBOARD'):
+                    self.phase != 'HOLD' or self.state.mode != 'OFFBOARD' or self.goal_queue):
                 return TriggerResponse(success=False, message='Rotation requires authorized airborne HOLD and fresh pose')
             self.hold_pose = self.copy_pose()
             q = self.hold_pose.orientation
@@ -872,11 +915,12 @@ class FlightManager:
             return 'Goal is inside an inflated obstacle voxel'
         return ''
 
-    def local_goal(self, request):
+    def local_goal(self, request, preserve_queue=False):
         with self.lock:
             goal=copy.deepcopy(request.goal)
             reason=self.goal_error(goal)
             if reason:return LocalGoalResponse(False,reason)
+            if not preserve_queue:self.clear_goal_queue()
             self.suspend_planner()
             self.active_navigation_speed=self.next_navigation_speed
             self.trajectory=None;self.pending_spline=None;self.future_command_since=None
@@ -891,10 +935,85 @@ class FlightManager:
             self.navigation_heading=self.pose_yaw(self.hold_pose)
             self.approved_spline_id=None;self.approved_curve=None
             self.goal_reached_since=None
+            self.goal_arrival_pose=None
+            self.terminal_last_curve_id=None
+            self.set_terminal_stage('CRUISE')
             self.set_phase('NAVIGATING')
             self.navigation_goal_pub.publish(goal)
+            self.yaw_last_tick=rospy.Time.now()
             self.request_planner(goal)
-            return LocalGoalResponse(True,'Goal queued for confirmed planning; speed %.2f m/s' % self.active_navigation_speed)
+            self.publish_goal_queue()
+            return LocalGoalResponse(True,'当前目标开始规划，速度 %.2f m/s' % self.active_navigation_speed)
+
+    def publish_goal_queue(self):
+        message=Path();message.header=Header(stamp=rospy.Time.now(),frame_id='odom')
+        message.poses=([copy.deepcopy(self.active_goal)] if self.active_goal is not None else [])+[
+            copy.deepcopy(goal) for goal in self.goal_queue]
+        self.queue_pub.publish(message)
+
+    def clear_goal_queue(self):
+        self.goal_queue=[]
+        self.queue_dispatch_after=None
+        self.queue_pub.publish(Path(header=Header(stamp=rospy.Time.now(),frame_id='odom')))
+
+    def queue_goal(self, request):
+        with self.lock:
+            goal=copy.deepcopy(request.goal);p=goal.pose.position
+            if (not self.authorized or not self.airborne() or not self.fresh_pose() or
+                    self.lio_quality!='HEALTHY' or self.state.mode!='OFFBOARD' or
+                    self.phase not in ('HOLD','NAVIGATING')):
+                return QueueGoalResponse(False,'Queue requires healthy authorized airborne HOLD/NAVIGATING',len(self.goal_queue))
+            if (goal.header.frame_id!='odom' or not self.in_flight_volume([p.x,p.y,p.z]) or
+                    not self.fresh_map() or not self.fresh_free_map()):
+                return QueueGoalResponse(False,'Invalid ENU goal, ceiling, or stale map',len(self.goal_queue))
+            if any(c in self.occupied_cells for c in self.segment_cells([p.x,p.y,p.z],[p.x,p.y,p.z])):
+                return QueueGoalResponse(False,'Goal lies in a known inflated obstacle',len(self.goal_queue))
+            if len(self.goal_queue)+(self.active_goal is not None)>=self.max_queue_points:
+                return QueueGoalResponse(False,'Queue limit is 100 points',len(self.goal_queue))
+            if self.phase=='HOLD' and not self.goal_queue:
+                reply=self.local_goal(request)
+                return QueueGoalResponse(reply.success,reply.message,1 if reply.success else 0)
+            # No publication to navigation_goal, no search or EGO call for future points.
+            self.goal_queue.append(goal);self.publish_goal_queue()
+            return QueueGoalResponse(True,'目标已加入队列；上一点到达后才开始规划此点',
+                                     len(self.goal_queue)+(self.active_goal is not None))
+
+    def dispatch_queued_goal(self, now):
+        if not self.goal_queue or self.queue_dispatch_after is None or now<self.queue_dispatch_after:
+            return
+        if not self.fresh_pose() or self.lio_quality!='HEALTHY' or self.health_fault_since is not None:
+            return
+        goal=self.goal_queue[0]
+        # Revalidate with the latest map; a point that became blocked pauses/cancels the mission.
+        reason=self.goal_error(goal)
+        if reason:
+            self.clear_goal_queue();self.error('Queued mission cancelled: '+reason);return
+        self.goal_queue.pop(0);self.queue_dispatch_after=None
+        reply=self.local_goal(SimpleNamespace(goal=goal),preserve_queue=True)
+        if not reply.success:
+            self.clear_goal_queue();self.error('Queued mission cancelled: '+reply.message)
+
+    def set_max_flight_height(self, request):
+        with self.lock:
+            height=request.height_m
+            if not math.isfinite(height) or not .8<=height<=self.configured_max_height:
+                return SetMaxFlightHeightResponse(False,self.max_flight_height,'Height must be 0.8..%.2f m ENU Z'%self.configured_max_height)
+            ground=(not self.state.armed and self.extended.landed_state==ExtendedState.LANDED_STATE_ON_GROUND)
+            if not ground and (self.phase!='HOLD' or not self.fresh_pose() or self.goal_queue or
+                               self.lio_quality!='HEALTHY' or self.state.mode!='OFFBOARD'):
+                return SetMaxFlightHeightResponse(False,self.max_flight_height,'Change ceiling on ground or in healthy HOLD')
+            if not ground and self.current_pose().position.z>height-self.ceiling_margin:
+                return SetMaxFlightHeightResponse(False,self.max_flight_height,'Ceiling must leave 0.20 m above current altitude')
+            self.max_flight_height=height;self.goal_max[2]=height-self.ceiling_margin
+            rospy.set_param('/drone/max_flight_height_m',height)
+            self.ceiling_pub.publish(Float64(data=height))
+            return SetMaxFlightHeightResponse(True,height,'最高高度已设置：%.2f m（ENU Z），目标与规划保留0.20 m裕量'%height)
+
+    def follow_navigation_heading(self, heading, now):
+        dt=max(0.,min(.10,(now-self.yaw_last_tick).to_sec())) if self.yaw_last_tick!=rospy.Time(0) else 0.
+        self.yaw_last_tick=now
+        delta=self.angle_delta(heading,self.navigation_heading)
+        self.navigation_heading=self.angle_delta(self.navigation_heading+max(-self.heading_rate*dt,min(self.heading_rate*dt,delta)),0.)
 
     def set_navigation_speed(self, request):
         with self.lock:
@@ -913,6 +1032,8 @@ class FlightManager:
             return TriggerResponse(success=True, message=self.phase)
 
     def start_landing(self, reason):
+        self.set_terminal_stage('IDLE')
+        self.clear_goal_queue()
         self.navigation_generation += 1
         self.suspend_planner()
         self.trajectory = None
@@ -985,7 +1106,8 @@ class FlightManager:
             # forward portion without reversing the route's direction.
             t = min(float(times[index]), end-min(.025, (end-begin)*.01))
         direction = tangent(t)
-        if not np.isfinite(direction).all() or math.hypot(direction[0], direction[1]) < .001:
+        minimum_speed = .05 if self.navigation_heading_ready and t-begin > .3 else .001
+        if not np.isfinite(direction).all() or math.hypot(direction[0], direction[1]) < minimum_speed:
             return None  # Pure vertical/finished curve: retain the current yaw.
         return math.atan2(direction[1], direction[0])
 
@@ -1017,7 +1139,6 @@ class FlightManager:
         self.approved_curve = None
         self.pending_goal = None
         self.future_command_since = None
-        self.goal_reached_since = None
         rospy.loginfo('Navigation heading alignment: target=%.2f deg; position held, goal retained',
                       math.degrees(self.heading_target))
 
@@ -1069,11 +1190,150 @@ class FlightManager:
         goal = copy.deepcopy(self.active_goal)
         # Retain the original task stamp across heading/replanning sessions.
         self.navigation_heading = self.heading_target
+        self.yaw_last_tick = now
         self.navigation_heading_ready = True
         self.pending_goal = None
         self.request_planner(goal)
         rospy.loginfo('Navigation heading aligned at %.2f deg; preparing a new current-pose planning session',
                       math.degrees(self.navigation_heading))
+
+    def set_terminal_stage(self, stage):
+        if self.terminal_stage != stage:
+            self.terminal_stage = stage
+            self.terminal_stage_pub.publish(String(data=stage))
+            rospy.loginfo('Terminal navigation stage: %s', stage)
+
+    def tick_goal_arrival(self, now):
+        """Same spherical tolerance and dwell in EVERY navigation substage."""
+        if self.active_goal is None:
+            return False
+        p = self.current_pose().position
+        g = self.active_goal.pose.position
+        v = self.odom.twist.twist.linear
+        reached = (self.fresh_pose() and
+                   math.dist([p.x, p.y, p.z], [g.x, g.y, g.z]) <= self.goal_tolerance and
+                   math.sqrt(v.x*v.x + v.y*v.y + v.z*v.z) <= self.goal_speed_tolerance)
+        if reached:
+            if self.goal_reached_since is None:
+                self.goal_reached_since = now
+                # Stop at the measured arrival pose, preserving actual yaw.
+                self.goal_arrival_pose = self.copy_pose()
+                if self.navigation_stage != 'ARRIVAL_CONFIRM':
+                    self.navigation_generation += 1
+                    self.required_trajectory_id = self.latest_command_id + 1
+                    self.suspend_planner()
+                    self.trajectory = None
+                    self.pending_spline = None
+                    self.approved_curve = None
+                    self.approved_spline_id = None
+                    self.future_command_since = None
+                    self.navigation_stage = 'ARRIVAL_CONFIRM'
+                    rospy.loginfo('Goal within %.3f m; confirming arrival from current internal stage', self.goal_tolerance)
+            elif (now-self.goal_reached_since).to_sec() >= 1.0:
+                goal = self.active_goal.pose.position
+                rospy.loginfo('Goal reached [%.3f %.3f %.3f]; remaining queued points %d',
+                              goal.x, goal.y, goal.z, len(self.goal_queue))
+                self.stop_navigation('', hold_pose=self.goal_arrival_pose, preserve_queue=True)
+                self.set_terminal_stage('COMPLETED')
+                self.queue_dispatch_after = now + rospy.Duration(.30)
+                self.publish_goal_queue()
+                return True
+            self.set_terminal_stage('ARRIVAL_CONFIRM')
+            self.navigation_wait_reason = '进入15cm到达范围，悬停确认连续稳定1秒'
+            self.setpoint_pub.publish(self.setpoint(self.goal_arrival_pose))
+            return True
+        self.goal_reached_since = None
+        if self.navigation_stage == 'ARRIVAL_CONFIRM':
+            # A short health warning cannot restart planning with bad data.
+            self.setpoint_pub.publish(self.setpoint(self.goal_arrival_pose))
+            if self.fresh_pose():
+                self.goal_arrival_pose = None
+                self.hold_pose = self.copy_pose()
+                self.navigation_heading = self.pose_yaw(self.hold_pose)
+                self.set_terminal_stage('APPROACH')
+                self.request_planner(copy.deepcopy(self.active_goal))
+                rospy.loginfo('Arrival tolerance lost; preparing a fresh terminal trajectory')
+            return True
+        self.goal_arrival_pose = None
+        return False
+
+    def update_terminal_approach(self):
+        if self.terminal_stage != 'CRUISE' or self.active_goal is None or self.global_route is None:
+            return
+        p = self.current_pose().position
+        limit = max(self.terminal_approach_distance,
+                    self.active_navigation_speed**2/(2*self.terminal_deceleration)+.3)
+        g = self.active_goal.pose.position
+        if math.dist([p.x, p.y, p.z], [g.x, g.y, g.z]) > limit:
+            return
+        points = [[x.pose.position.x, x.pose.position.y, x.pose.position.z] for x in self.global_route.poses]
+        if len(points) < 2:
+            return
+        remaining = math.dist([p.x, p.y, p.z], points[0]) + sum(math.dist(a, b) for a, b in zip(points, points[1:]))
+        if remaining <= limit:
+            self.set_terminal_stage('APPROACH')
+
+    def tick_terminal_endpoint(self, now):
+        """Settle at the SAME approved zero-speed curve endpoint, bounded in time.
+
+        No new path or direct unchecked goal command is manufactured. Each
+        small tracking segment still passes occupied/observed-free checks.
+        """
+        curve = self.approved_curve
+        if curve is None or self.active_goal is None or not self.navigation_heading_ready:
+            return False
+        duration = curve.knots[len(curve.pos_pts)]-curve.knots[curve.order]
+        elapsed = (now-curve.start_time).to_sec()
+        if elapsed < duration:
+            return False
+        # Cache values from this exact approved control spline.
+        if self.terminal_curve_cache is None or self.terminal_curve_cache[0] is not curve:
+            spline = BSpline(curve.knots, [[x.x, x.y, x.z] for x in curve.pos_pts], curve.order, extrapolate=False)
+            end_time = curve.knots[len(curve.pos_pts)]
+            self.terminal_curve_cache = (curve, spline(end_time), spline.derivative()(end_time))
+        _, endpoint, velocity = self.terminal_curve_cache
+        g = self.active_goal.pose.position
+        p = self.current_pose().position
+        if math.dist(endpoint, [g.x, g.y, g.z]) > .02 or float(np.linalg.norm(velocity)) > .03:
+            return False
+        if math.dist(endpoint, [p.x, p.y, p.z]) > min(.4, self.max_setpoint_step):
+            return False
+        if elapsed-duration > self.terminal_settle_time:
+            self.wait_for_space('Terminal convergence timed out; requesting a fresh short trajectory')
+            return True
+        # Do not command a backward correction beyond arrival tolerance. A
+        # new actual EGO curve supplies any required turn, never tracking error.
+        dx, dy = float(endpoint[0])-p.x, float(endpoint[1])-p.y
+        if math.hypot(dx, dy) > self.goal_tolerance and abs(self.angle_delta(math.atan2(dy, dx), self.pose_yaw(self.current_pose()))) > self.heading_half_cone:
+            return False
+        command = PositionCommand()
+        command.header = Header(stamp=now, frame_id='odom')
+        command.trajectory_id = self.approved_spline_id
+        command.yaw = self.navigation_heading
+        command.position = Point(x=float(endpoint[0]), y=float(endpoint[1]), z=float(endpoint[2]))
+        reason = self.command_error(command)
+        start = [p.x, p.y, p.z]
+        if not reason and self.require_observed_free and any(c not in self.observed_free for c in self.segment_cells(start, endpoint)):
+            reason = 'Terminal tracking segment enters unobserved space'
+        if reason:
+            self.navigation_command_failed(reason)
+            return True
+        if self.terminal_last_curve_id != self.approved_spline_id:
+            rospy.loginfo('Settling approved terminal curve %d, endpoint error %.3f m',
+                          self.approved_spline_id, math.dist(endpoint, start))
+            self.terminal_last_curve_id = self.approved_spline_id
+        self.set_terminal_stage('CONVERGING')
+        self.navigation_wait_reason = '末段已平稳停止，持续跟踪批准曲线终点以收敛位置'
+        pose = self.copy_pose()
+        pose.position = command.position
+        self.set_pose_yaw(pose, self.navigation_heading)
+        target = self.setpoint(pose)
+        target.type_mask &= ~(PositionTarget.IGNORE_VX | PositionTarget.IGNORE_VY | PositionTarget.IGNORE_VZ)
+        # The approved endpoint has zero desired velocity; this is feedforward,
+        # never an external velocity measurement for the PX4 EKF.
+        self.setpoint_pub.publish(target)
+        self.publish_execution_curve(curve)
+        return True
 
     @staticmethod
     def setpoint(pose):
@@ -1123,6 +1383,10 @@ class FlightManager:
                 self.last_healthy_pose = self.copy_pose()
             if not self.state.armed:
                 self.health_landing_latched = False
+                if self.goal_queue or self.active_goal is not None:
+                    self.clear_goal_queue()
+                    self.active_goal=None
+                    self.publish_goal_queue()
             elapsed = max(0., (now-self.health_fault_since).to_nsec()/1e9) if self.health_fault_since is not None else 0.
             quality = ('SEVERE' if severe or elapsed >= 1.0 or self.health_landing_latched else
                        'HOLD' if elapsed >= .5 or self.lio_quality == 'HOLD' else
@@ -1137,7 +1401,7 @@ class FlightManager:
                 if quality == 'SEVERE':
                     self.health_landing_latched = True
                     self.start_landing('Severe health fault or health unavailable for 1 s: '+self.pose_health_detail)
-                elif quality == 'HOLD' and self.phase != 'HOLD':
+                elif quality == 'HOLD' and (self.phase != 'HOLD' or self.goal_queue):
                     # Freeze at the last accepted pose; never use invalid/new data
                     # to resume the cancelled task. Keep sending OFFBOARD targets.
                     reply = self.hold(None, health_override=True)
@@ -1147,6 +1411,9 @@ class FlightManager:
                 return
             if not self.state.armed and self.phase in ('DISCONNECTED', 'LOCALIZING', 'READY'):
                 self.set_phase('READY' if self.fresh_pose() else 'LOCALIZING')
+            if (self.airborne() and self.phase not in ('LANDING','DESCENDING','FAILSAFE') and
+                    self.odom is not None and self.current_pose().position.z > self.max_flight_height+.05):
+                self.start_landing('Virtual ceiling exceeded; landing')
             if self.phase == 'PRIMING_ARM':
                 if not self.authorized or not self.fresh_pose():
                     self.set_phase('READY')
@@ -1220,9 +1487,6 @@ class FlightManager:
                     self.set_phase('HOLD')
                 return
             if self.phase == 'NAVIGATING':
-                self.activate_pending_spline()
-                if self.phase != 'NAVIGATING':
-                    return
                 if self.state.mode != 'OFFBOARD':
                     self.start_landing('PX4 left OFFBOARD during navigation')
                     return
@@ -1235,9 +1499,15 @@ class FlightManager:
                     if any(c in self.occupied_cells for c in self.segment_cells(values, values)):
                         self.stop_navigation('Goal is now inside a known inflated obstacle; navigation cancelled')
                         return
+                if self.tick_goal_arrival(now):
+                    return
+                self.activate_pending_spline()
+                if self.phase != 'NAVIGATING':
+                    return
+                self.update_terminal_approach()
                 if self.navigation_stage == 'PLANNING':
                     self.setpoint_pub.publish(self.setpoint(self.hold_pose))
-                    if (now-self.goal_start).to_sec()>8. or time.monotonic()-self.planner_ack_wall>20.:
+                    if time.monotonic()-self.planner_ack_wall>50.:
                         self.stop_navigation('New planning session ACK timed out')
                     return
                 if self.navigation_stage == 'SPACE_WAIT':
@@ -1272,28 +1542,8 @@ class FlightManager:
                 if not self.fresh_map():
                     self.stop_navigation('Obstacle map became stale; navigation cancelled')
                     return
-                if self.active_goal:
-                    p = self.current_pose().position
-                    g = self.active_goal.pose.position
-                    v = self.odom.twist.twist.linear
-                    reached = (math.sqrt((p.x-g.x)**2+(p.y-g.y)**2+(p.z-g.z)**2) <= self.goal_tolerance and
-                               math.sqrt(v.x*v.x+v.y*v.y+v.z*v.z) <= self.goal_speed_tolerance)
-                    if reached:
-                        if self.goal_reached_since is None:
-                            self.goal_reached_since = now
-                            self.goal_arrival_pose = self.copy_pose()
-                            self.set_pose_yaw(self.goal_arrival_pose, self.navigation_heading)
-                        elif (now-self.goal_reached_since).to_sec() >= 1.0:
-                            # Arrival is defined by the existing 15 cm tolerance.
-                            # Hold its arrival point rather than command a blind
-                            # backwards correction to the exact goal coordinate.
-                            self.stop_navigation('', hold_pose=self.goal_arrival_pose)
-                            return
-                        self.setpoint_pub.publish(self.setpoint(self.goal_arrival_pose))
-                        return
-                    else:
-                        self.goal_reached_since = None
-                        self.goal_arrival_pose = None
+                if self.tick_terminal_endpoint(now):
+                    return
                 if self.approved_curve is not None:
                     curve = self.approved_curve
                     duration = curve.knots[len(curve.pos_pts)]-curve.knots[3]
@@ -1330,6 +1580,10 @@ class FlightManager:
                         if reason:
                             self.navigation_command_failed(reason)
                             return
+                    if heading is not None:
+                        self.follow_navigation_heading(heading, now)
+                    else:
+                        self.yaw_last_tick = now
                     pose = self.copy_pose()
                     pose.position = self.trajectory.position
                     self.set_pose_yaw(pose, self.navigation_heading)
@@ -1342,7 +1596,7 @@ class FlightManager:
                     target.velocity.x = self.trajectory.velocity.x
                     target.velocity.y = self.trajectory.velocity.y
                     target.velocity.z = self.trajectory.velocity.z
-                    self.navigation_wait_reason='沿审批路线执行'
+                    self.navigation_wait_reason=('终点接近：沿减速EGO曲线执行' if self.terminal_stage == 'APPROACH' else '沿审批路线执行')
                     self.setpoint_pub.publish(target)
                     self.publish_execution_curve(self.approved_curve)
                 elif self.trajectory is not None:
@@ -1371,6 +1625,7 @@ class FlightManager:
                     self.start_landing('PX4 left OFFBOARD during hold')
                     return
                 self.setpoint_pub.publish(self.setpoint(self.hold_pose))
+                self.dispatch_queued_goal(now)
             if self.phase == 'DESCENDING':
                 if not self.fresh_pose():
                     self.set_phase('FAILSAFE')
