@@ -17,17 +17,22 @@ import time
 
 def fingerprint(root):
     paths=[]
-    for directory in ['config','launch','scripts','models','worlds']:
+    for directory in ['config','launch','scripts','models','worlds','patches']:
         paths.extend(p for p in (root/'src/drone_stack'/directory).rglob('*')
                      if p.is_file() and '__pycache__' not in p.parts)
     paths.extend((root/'src/ego_planner/src/planner').rglob('*.cpp'))
     paths.extend((root/'src/ego_planner/src/planner').rglob('*.h'))
-    paths.extend([root/'devel/lib/libplan_env.so',root/'devel/lib/ego_planner/ego_planner_node'])
+    paths.extend(root/path for path in ['devel/lib/libplan_env.so',
+        'devel/lib/libbspline_opt.so','devel/lib/libpath_searching.so',
+        'devel/lib/libtraj_utils.so','devel/lib/ego_planner/traj_server',
+        'devel/lib/ego_planner/ego_planner_node'])
     for pattern in ['*.cc','*.cpp','*.h','*.hpp']:
         paths.extend((root/'src/faster_lio_main/src').rglob(pattern))
         paths.extend((root/'src/faster_lio_main/include').rglob(pattern))
     paths.extend([root/'src/faster_lio_main/CMakeLists.txt',root/'src/faster_lio_main/package.xml',
-                  root/'devel/lib/faster_lio/run_mapping_online'])
+                  root/'devel/lib/faster_lio/run_mapping_online',root/'devel/lib/libfaster_lio.so',
+                  root/'external/PX4-Autopilot/build/px4_sitl_inspection/bin/px4',
+                  root/'external/PX4-Autopilot/build/px4_sitl_inspection/build_gazebo-classic/libgazebo_imu_plugin.so'])
     paths.extend((root/'src/drone_stack/src').rglob('*.cpp'))
     paths.extend([root/'src/drone_stack/package.xml',root/'src/drone_stack/CMakeLists.txt',
                   root/'devel/lib/drone_stack/drone_operator_gui'])

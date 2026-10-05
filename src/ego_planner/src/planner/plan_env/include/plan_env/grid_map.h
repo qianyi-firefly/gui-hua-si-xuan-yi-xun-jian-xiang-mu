@@ -55,6 +55,8 @@ struct MappingParameters {
   double resolution_, resolution_inv_;
   double obstacles_inflation_, obstacles_inflation_z_;
   bool retain_cloud_obstacles_;
+  bool require_observed_free_;
+  Eigen::Vector3d cloud_sensor_offset_, cloud_body_half_extent_;
   string frame_id_;
   int pose_type_;
 
@@ -92,6 +94,12 @@ struct MappingData {
 
   std::vector<double> occupancy_buffer_;
   std::vector<char> occupancy_buffer_inflate_;
+  std::vector<char> cloud_observed_free_;
+  // Raw evidence and exact inflation reference counts; no accumulation of
+  // previously inflated observations. Scan flags deduplicate rays per frame.
+  std::vector<unsigned char> cloud_evidence_;
+  std::vector<unsigned char> cloud_scan_flags_;
+  std::vector<unsigned int> cloud_inflate_refs_;
 
   // camera position and pose data
 
@@ -110,7 +118,7 @@ struct MappingData {
   bool occ_need_update_, local_updated_;
   bool has_first_depth_;
   bool has_odom_, has_cloud_;
-  ros::Time last_observation_stamp_, pending_depth_stamp_;
+  ros::Time last_observation_stamp_, pending_depth_stamp_, last_published_stamp_;
 
   // depth image projected point cloud
 
@@ -197,6 +205,8 @@ private:
                          const geometry_msgs::PoseStampedConstPtr& pose);
   void depthOdomCallback(const sensor_msgs::ImageConstPtr& img, const nav_msgs::OdometryConstPtr& odom);
   void cloudCallback(const sensor_msgs::PointCloud2ConstPtr& img);
+  void cloudPoseCallback(const sensor_msgs::PointCloud2ConstPtr& img,
+                         const geometry_msgs::PoseStampedConstPtr& pose);
   void odomCallback(const nav_msgs::OdometryConstPtr& odom);
 
   // update occupancy by raycasting
@@ -231,8 +241,11 @@ private:
   SynchronizerImagePose sync_image_pose_;
   SynchronizerImageOdom sync_image_odom_;
 
+  shared_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> synced_cloud_sub_;
+  shared_ptr<message_filters::Subscriber<geometry_msgs::PoseStamped>> cloud_pose_sub_;
+  shared_ptr<message_filters::TimeSynchronizer<sensor_msgs::PointCloud2, geometry_msgs::PoseStamped>> cloud_pose_sync_;
   ros::Subscriber indep_cloud_sub_, indep_odom_sub_;
-  ros::Publisher map_pub_, map_inf_pub_, map_inf_safety_pub_;
+  ros::Publisher map_pub_, map_inf_pub_, map_inf_safety_pub_, observed_free_pub_;
   ros::Publisher unknown_pub_;
   ros::Timer occ_timer_, vis_timer_;
 

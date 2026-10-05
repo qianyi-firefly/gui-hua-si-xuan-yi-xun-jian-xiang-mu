@@ -37,6 +37,10 @@ namespace ego_planner
 
     void initPlanModules(ros::NodeHandle &nh, PlanningVisualization::Ptr vis = NULL);
 
+    void setNavigationSpeed(double speed) { pp_.max_vel_ = speed; bspline_optimizer_rebound_->setMaxVelocity(speed); }
+
+    // Current forward slice of the authoritative smooth global reference.
+    std::vector<Eigen::Vector3d> route_seed_;
     PlanParameters pp_;
     LocalTrajData local_data_;
     GlobalTrajData global_data_;

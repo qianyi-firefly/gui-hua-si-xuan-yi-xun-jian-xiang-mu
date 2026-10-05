@@ -11,7 +11,7 @@ from std_msgs.msg import Header,String
 p=argparse.ArgumentParser();p.add_argument('directory');p.add_argument('--mode',choices=['retain','replace'],required=True);p.add_argument('--ready-gate',action='store_true');a=p.parse_args()
 root=Path(__file__).resolve().parents[2];out=Path(a.directory).resolve();out.mkdir(parents=True,exist_ok=True)
 if rosgraph.is_master_online():raise SystemExit('An existing ROS master must be stopped first.')
-keep=a.mode=='retain';launch=out/'map_test.launch';launch.write_text('<launch><include file="'+str(root/'src/drone_stack/launch/ego.launch')+'"/><param name="/ego_planner_node/grid_map/retain_cloud_obstacles" value="'+str(keep).lower()+'"/><param name="/ego_planner_node/grid_map/cloud_memory_start_topic" value="'+('/drone/flight_state' if a.ready_gate else '')+'"/></launch>\n')
+keep=a.mode=='retain';launch=out/'map_test.launch';launch.write_text('<launch><include file="'+str(root/'src/drone_stack/launch/ego.launch')+'"/><param name="/ego_planner_node/grid_map/retain_cloud_obstacles" value="'+str(keep).lower()+'"/><param name="/ego_planner_node/grid_map/cloud_memory_start_topic" value="'+('/drone/flight_state' if a.ready_gate else '')+'"/><param name="/ego_planner_node/grid_map/require_observed_free" value="false"/><param name="/ego_planner_node/grid_map/cloud_body_pose_topic" value=""/></launch>\n')
 env=dict(os.environ,ROS_HOSTNAME='127.0.0.1',ROS_MASTER_URI='http://127.0.0.1:11311');env.pop('ROS_IP',None)
 sys.path.insert(0,str(root/'src/drone_stack/scripts'))
 from run_core_acceptance import fingerprint

@@ -25,6 +25,7 @@
     <arg name="flight_type" value="1"/>
   </include>
   <param name="/ego_planner_node/grid_map/frame_id" value="odom"/>
+  <param name="/ego_planner_node/fsm/use_global_route" value="true"/>
   <!-- Cover the quadrotor's roughly 0.30 m horizontal radius plus margin. -->
   <param name="/ego_planner_node/grid_map/obstacles_inflation" value="0.40"/>
   <!-- Close vertical gaps in the downsampled lidar surface and forbid the
@@ -35,6 +36,10 @@
   <param name="/ego_planner_node/grid_map/cloud_memory_start_topic" value="/drone/flight_state"/>
   <param name="/ego_planner_node/grid_map/ground_height" value="0.5"/>
   <param name="/ego_planner_node/grid_map/virtual_ceil_height" value="2.6"/>
+  <param name="/ego_planner_node/grid_map/require_observed_free" value="true"/>
+  <param name="/ego_planner_node/grid_map/cloud_body_pose_topic" value="/drone/cloud_body_pose"/>
+  <rosparam param="/ego_planner_node/grid_map/cloud_body_half_extent">[0.235, 0.235, 0.055]</rosparam>
+  <rosparam param="/ego_planner_node/grid_map/cloud_sensor_xyz_body">[0.27, 0.0, 0.10]</rosparam>
   <node pkg="ego_planner" type="traj_server" name="traj_server" output="screen">
     <remap from="/position_cmd" to="/planning/pos_cmd"/>
     <remap from="/odom_world" to="/mavros/local_position/odom"/>

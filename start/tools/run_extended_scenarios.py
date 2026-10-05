@@ -27,7 +27,7 @@ def main():
     from audit_px4_ulog import audit
     from audit_offboard_loss import audit as native_offboard_audit
     from audit_world_bag import audit as geometry_audit
-    from extended_flight_probe import FAULT_NODES,INPUT_FAULTS,COMM_FAULTS,GUI_CASES
+    from extended_flight_probe import FAULT_NODES,INPUT_FAULTS,GEOMETRY_FAULTS,COMM_FAULTS,GUI_CASES,ADDITIONAL_CASES
     base=Path(args.directory).resolve()
     base.mkdir(parents=True,exist_ok=False)
     if rosgraph.is_master_online():
@@ -48,14 +48,14 @@ def main():
             '/mavros/extended_state','/mavros/setpoint_raw/local','/mavros/odometry/out',
             '/mavros/estimator_status','/drone/lio/odom','/drone/lio/valid',
             '/drone/flight_state','/drone/flight_error','/drone/manager_heartbeat',
-            '/grid_map/occupancy_inflate_safety','/planning/pos_cmd','/planning/bspline',
+            '/grid_map/occupancy_inflate_safety','/grid_map/observed_free','/drone/cloud_body_pose','/planning/pos_cmd','/planning/data_display','/faster_lio/translation_observability','/Odometry','/planning/bspline',
             '/drone/planning_enabled','/move_base_simple/goal','/rosout']
     if args.diagnostic_sensors:
         topics += ['/drone/sim/lidar/points','/drone/sim/lidar/imu_raw',
                    '/livox/lidar','/livox/imu','/Odometry','/cloud_registered']
     ulog_dir=root/'external/PX4-Autopilot/build/px4_sitl_inspection/rootfs/log'
     for case in args.cases:
-        if case not in ['multi_goal','corridor','three_d','blocked','boundaries','stress']+list(FAULT_NODES)+INPUT_FAULTS+COMM_FAULTS+GUI_CASES:
+        if case not in ['multi_goal','corridor','three_d','blocked','boundaries','stress']+list(FAULT_NODES)+INPUT_FAULTS+GEOMETRY_FAULTS+COMM_FAULTS+GUI_CASES+ADDITIONAL_CASES:
             raise ValueError('Unknown case '+case)
         directory=base/case
         directory.mkdir()
@@ -92,7 +92,7 @@ def main():
                     raise RuntimeError('Simulator startup failed')
                 time.sleep(.2)
             with (directory/'rosbag.log').open('w') as out:
-                bag=subprocess.Popen(['rosbag','record','--lz4','-O',str(directory/'telemetry.bag')]+topics,
+                bag=subprocess.Popen(['rosbag','record','--lz4','-O',str(directory/'telemetry.bag')]+topics+(['/livox/lidar','/livox/imu'] if case in GEOMETRY_FAULTS else []),
                     env=env,stdout=out,stderr=subprocess.STDOUT)
             env['DRONE_EXPERIMENT_DIR']=str(directory)
             for mode in ['ground_safety','takeoff','airborne_safety']:
@@ -100,7 +100,7 @@ def main():
                     raise RuntimeError(mode+' failed')
             gui_trigger={'kill_lio':'lio_invalid','kill_bridge':'lio_invalid','kill_manager':'manager_stale',
                          'kill_mavros':'fcu_stale','pose_jump':'lio_invalid','timestamp_regression':'lio_invalid',
-                         'clock_reset':'lio_invalid','gui_camera_loss':'camera_stale'}.get(case)
+                         'clock_reset':'lio_invalid','geometry_loss':'lio_invalid','gui_camera_loss':'camera_stale'}.get(case)
             if gui_trigger:
                 with (directory/'gui_observer.log').open('w') as out:
                     gui_observer=subprocess.Popen([sys.executable,str(Path(__file__).with_name('capture_live_gui.py')),
@@ -139,7 +139,9 @@ def main():
         new_ulogs=sorted(set(ulog_dir.rglob('*.ulg'))-old_ulogs,key=lambda p:p.stat().st_mtime)
         if new_ulogs:
             shutil.copy2(new_ulogs[-1],directory/'flight.ulg')
-            fusion=audit(directory/'flight.ulg',allow_pose_loss=case in ['kill_lio','kill_bridge','kill_mavros']+INPUT_FAULTS+COMM_FAULTS)
+            observed_loss = case=='blocked' and (directory/'scenario.json').exists() and any(
+                'observability_landing' in step for step in json.loads((directory/'scenario.json').read_text()).get('steps',[]))
+            fusion=audit(directory/'flight.ulg',allow_pose_loss=observed_loss or case in ['kill_lio','kill_bridge','kill_mavros','high_lio_loss']+INPUT_FAULTS+GEOMETRY_FAULTS+COMM_FAULTS)
             (directory/'fusion_audit.json').write_text(json.dumps(fusion,indent=2)+'\n')
             entry['fusion_audit_passed']=fusion['passed']
             if case in ['kill_manager','kill_mavros']+COMM_FAULTS:
@@ -151,7 +153,7 @@ def main():
         if (directory/'telemetry.bag').exists():
             try:
                 geometry=geometry_audit(directory/'telemetry.bag',world)
-                if case in ['boundaries','blocked']+list(FAULT_NODES)+INPUT_FAULTS+COMM_FAULTS+GUI_CASES:
+                if case in ['boundaries','blocked']+list(FAULT_NODES)+INPUT_FAULTS+GEOMETRY_FAULTS+COMM_FAULTS+GUI_CASES+ADDITIONAL_CASES:
                     # Rejected requests deliberately do not enter NAVIGATING.
                     geometry['passed']=bool(geometry.get('truth_samples',0)>0 and
                         geometry.get('overlap_samples',1)==0 and
@@ -161,10 +163,15 @@ def main():
                 entry['geometry_audit_passed']=geometry['passed']
             except Exception as exc:
                 entry['geometry_audit_passed']=False;entry['geometry_error']=str(exc)
+        if case in GEOMETRY_FAULTS:
+            from audit_observability_fault import audit as observability_audit
+            proof=observability_audit(directory/'telemetry.bag',directory/'scenario.json')
+            (directory/'observability_audit.json').write_text(json.dumps(proof,indent=2)+'\n')
+            entry['observability_audit_passed']=proof['passed']
         entry['passed']=bool('error' not in entry and len(entry['checks'])==5 and
             all(c['passed'] for c in entry['checks']) and entry['fusion_audit_passed'] and
             entry.get('geometry_audit_passed',False) and entry.get('offboard_native_audit_passed',True) and
-            entry.get('gui_audit_passed',True) and
+            entry.get('gui_audit_passed',True) and entry.get('observability_audit_passed',True) and
             fingerprint(root)==summary['configuration_sha256'] and summary['tool_sha256']==
             {p.name:hashlib.sha256(p.read_bytes()).hexdigest() for p in Path(__file__).parent.glob('*.py')})
         summary['cases'].append(entry)

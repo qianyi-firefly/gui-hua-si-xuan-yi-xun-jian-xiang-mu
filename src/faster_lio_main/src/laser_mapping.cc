@@ -2,6 +2,7 @@
 #include <yaml-cpp/yaml.h>
 #include <execution>
 #include <fstream>
+#include <iomanip>
 
 #include "laser_mapping.h"
 #include "utils.h"
@@ -172,6 +173,7 @@ bool LaserMapping::LoadParams(ros::NodeHandle &nh)
   p_imu_->SetAccCov(common::V3D(acc_cov, acc_cov, acc_cov));
   p_imu_->SetGyrBiasCov(common::V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
   p_imu_->SetAccBiasCov(common::V3D(b_acc_cov, b_acc_cov, b_acc_cov));
+  nh.param<double>("mapping/min_translation_support", min_translation_support_, 0.0);
   int imu_init_samples;
   nh.param<int>("mapping/imu_init_samples", imu_init_samples, 20);
   p_imu_->SetInitSamples(imu_init_samples);
@@ -202,6 +204,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file)
 
     options::NUM_MAX_ITERATIONS   = yaml["max_iteration"].as<int>();
     options::ESTI_PLANE_THRESHOLD = yaml["esti_plane_threshold"].as<float>();
+    min_translation_support_ = yaml["mapping"]["min_translation_support"].as<double>(0.0);
     time_sync_en_                 = yaml["common"]["time_sync_en"].as<bool>();
 
     filter_size_surf_min     = yaml["filter_size_surf"].as<float>();
@@ -289,6 +292,7 @@ bool LaserMapping::LoadParamsFromYAML(const std::string &yaml_file)
   p_imu_->SetGyrBiasCov(common::V3D(b_gyr_cov, b_gyr_cov, b_gyr_cov));
   p_imu_->SetAccBiasCov(common::V3D(b_acc_cov, b_acc_cov, b_acc_cov));
 
+  p_imu_->SetInitSamples(YAML::LoadFile(yaml_file)["mapping"]["imu_init_samples"].as<int>(20));
   run_in_offline_ = true;
   return true;
 }
@@ -325,6 +329,7 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh)
   path_.header.stamp    = ros::Time::now();
   path_.header.frame_id = "camera_init";
 
+  pub_translation_observability_ = nh.advertise<std_msgs::Float64MultiArray>("/faster_lio/translation_observability", 10);
   pub_laser_cloud_world_ =
     nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
   pub_laser_cloud_body_ =
@@ -781,6 +786,7 @@ void LaserMapping::ObsModel(state_ikfom &                          s,
 
   if(effect_feat_num_ < 1)
   {
+    translation_observability_=analyzeTranslation(Eigen::Matrix3d::Zero(),min_translation_support_);
     ekfom_data.valid = false;
     LOG(WARNING) << "No Effective Points!";
     return;
@@ -796,6 +802,15 @@ void LaserMapping::ObsModel(state_ikfom &                          s,
       index.resize(effect_feat_num_);
       const common::M3F off_R = s.offset_R_L_I.toRotationMatrix().cast<float>();
       const common::V3F off_t = s.offset_T_L_I.cast<float>();
+      Eigen::Matrix3d information=Eigen::Matrix3d::Zero();
+      for (int j=0;j<effect_feat_num_;++j) {
+        const Eigen::Vector3d normal=corr_norm_[j].head<3>().cast<double>();
+        information.noalias() += normal*normal.transpose();
+      }
+      translation_observability_=analyzeTranslation(information,min_translation_support_);
+      LOG(INFO) << "[ translation_observability ] stamp=" << std::setprecision(12) << lidar_end_time_
+                << " support=" << translation_observability_.strengths.transpose()
+                << " correspondences=" << effect_feat_num_;
       const common::M3F Rt = s.rot.toRotationMatrix().transpose().cast<float>();
 
       std::for_each(
@@ -860,7 +875,6 @@ void LaserMapping::PublishOdometry(const ros::Publisher &pub_odom_aft_mapped)
   odom_aft_mapped_.twist.twist.linear.z = state_point_.vel(2);
   SetPosestamp(odom_aft_mapped_.pose);
 
-  pub_odom_aft_mapped.publish(odom_aft_mapped_);
   auto P = kf_.get_P();
   for(int i = 0; i < 6; i++)
   {
@@ -872,6 +886,16 @@ void LaserMapping::PublishOdometry(const ros::Publisher &pub_odom_aft_mapped)
     odom_aft_mapped_.pose.covariance[i * 6 + 4] = P(k, 1);
     odom_aft_mapped_.pose.covariance[i * 6 + 5] = P(k, 2);
   }
+
+  // Keep the estimator covariance separate from the geometry diagnostic.
+  // The bridge applies timed warning/HOLD/landing protection to that diagnostic;
+  // a single weak scan must not masquerade as a permanent numerical failure.
+  pub_odom_aft_mapped.publish(odom_aft_mapped_);
+  std_msgs::Float64MultiArray diagnostic;
+  diagnostic.data={lidar_end_time_,translation_observability_.strengths(0),
+                   translation_observability_.strengths(1),translation_observability_.strengths(2),
+                   double(effect_feat_num_),translation_observability_.covariance_inflation.trace()};
+  pub_translation_observability_.publish(diagnostic);
 
   static tf::TransformBroadcaster br;
   tf::Transform                   transform;

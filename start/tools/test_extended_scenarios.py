@@ -8,6 +8,16 @@ import extended_flight_probe as probe
 
 
 class ScenarioChecks(unittest.TestCase):
+    def test_native_heartbeat_freshness_uses_sim_time_and_wall_watchdog(self):
+        monitor=probe.NativeMonitor.__new__(probe.NativeMonitor)
+        monitor.last={'sim_t':9.5,'wall_monotonic':100.}
+        with patch.object(probe.rospy.Time,'now',return_value=probe.rospy.Time(10)),patch.object(probe.time,'monotonic',return_value=104.):
+            self.assertTrue(monitor.fresh())
+        with patch.object(probe.rospy.Time,'now',return_value=probe.rospy.Time(12)),patch.object(probe.time,'monotonic',return_value=101.):
+            self.assertFalse(monitor.fresh())
+        with patch.object(probe.rospy.Time,'now',return_value=probe.rospy.Time(10)),patch.object(probe.time,'monotonic',return_value=111.):
+            self.assertFalse(monitor.fresh())
+
     def setUp(self):
         clock=patch.object(probe.rospy.Time,'now',return_value=probe.rospy.Time(10))
         clock.start()
@@ -16,7 +26,7 @@ class ScenarioChecks(unittest.TestCase):
     def client(self):
         p=probe.Probe.__new__(probe.Probe)
         p.data={'phase':SimpleNamespace(data='HOLD'), 'state':SimpleNamespace(mode='OFFBOARD')}
-        p.error_sequence=0
+        p.error_sequence=0;p.observation_loss=None;p.phase_changes=[];p.hover_prefix=None
         p.position=Mock(return_value=np.array([0.,0.,1.]))
         p.wait=Mock()
         return p
@@ -53,6 +63,40 @@ class ScenarioChecks(unittest.TestCase):
         with patch.object(probe.time,'monotonic',side_effect=[0,4]):
             with self.assertRaisesRegex(RuntimeError,'Timed out'):
                 p.navigate(np.array([1.,0.,1.]))
+
+    def test_blocked_goal_awaits_navigation_then_hold(self):
+        p=self.client();p.goal=Mock(return_value={'accepted':True})
+        p.data['error']=SimpleNamespace(data='Full EGO trajectory enters unobserved space')
+        p.hover=Mock(return_value={'passed':True})
+        states=iter(['NAVIGATING','HOLD'])
+        def advance(condition,seconds):
+            p.data['phase'].data=next(states)
+            self.assertTrue(condition())
+        p.wait=Mock(side_effect=advance)
+        self.assertTrue(p.blocked_goal(np.array([0.,0.,1.]))['hover']['passed'])
+        self.assertEqual(p.wait.call_count,2)
+
+    def test_blocked_rejected_goal_does_not_wait_for_navigation(self):
+        p=self.client();p.goal=Mock(return_value={'accepted':False,'message':'Goal is in unobserved space'})
+        p.hover=Mock(return_value={'passed':True})
+        p.blocked_goal(np.array([0.,0.,1.]))
+        p.wait.assert_not_called()
+
+    def test_blocked_observability_landing_uses_verified_handler(self):
+        p=self.client();p.goal=Mock(return_value={'accepted':True})
+        states=iter(['NAVIGATING','LANDING'])
+        def advance(condition,seconds):
+            p.data['phase'].data=next(states)
+            self.assertTrue(condition())
+        p.wait=Mock(side_effect=advance)
+        p.observability_landing=Mock(return_value={'observability_landing':{'passed':True}})
+        self.assertTrue(p.blocked_goal(np.array([0.,0.,1.]))['observability_landing']['passed'])
+        p.observability_landing.assert_called_once()
+
+    def test_blocked_readiness_failure_cannot_pass(self):
+        p=self.client();p.goal=Mock(return_value={'accepted':False,'message':'Need fresh observed free-space map before navigation'})
+        with self.assertRaisesRegex(RuntimeError,'unrelated readiness'):
+            p.blocked_goal(np.array([0.,0.,1.]))
 
     def test_goal_keeps_enu_values(self):
         p=self.client()

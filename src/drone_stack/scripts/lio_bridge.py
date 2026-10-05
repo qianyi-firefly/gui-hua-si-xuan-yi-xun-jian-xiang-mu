@@ -4,17 +4,19 @@
 MAVROS owns the ENU/FLU to NED/FRD conversion. This node never performs it.
 """
 import copy
+import json
 import math
+import threading
 from collections import deque
 
 import numpy as np
 import rospy
 import tf
-from geometry_msgs.msg import TransformStamped
+from geometry_msgs.msg import TransformStamped, PoseStamped
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import PointCloud2, PointField
 from rosgraph_msgs.msg import Clock
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String, Float64MultiArray
 from tf.transformations import (concatenate_matrices, inverse_matrix,
                                 quaternion_from_matrix, quaternion_matrix,
                                 translation_matrix)
@@ -23,6 +25,7 @@ import tf2_ros
 
 class LioBridge:
     def __init__(self):
+        self.lock = threading.RLock()
         self.last_stamp = rospy.Time(0)
         # A 10 Hz scan plus mapping can be ~0.25 s old when published.
         self.max_age = rospy.get_param('~max_age_s', 0.6)
@@ -32,6 +35,20 @@ class LioBridge:
         self.max_rotation_step = rospy.get_param('~max_rotation_step_rad', 0.3)
         self.max_rotation_speed = rospy.get_param('~max_rotation_speed_radps', 4.0)
         self.pose_fault = False
+        self.geometry_stamp = rospy.Time(0)
+        self.geometry_low_since = None
+        self.geometry_good_since = None
+        self.geometry_low = False
+        self.geometry_quality = 'UNKNOWN'
+        self.geometry_min_support = rospy.get_param('/mapping/min_translation_support', 50.0)
+        self.geometry_hold_s = rospy.get_param('~geometry_hold_s', 0.5)
+        self.geometry_land_s = rospy.get_param('~geometry_land_s', 1.0)
+        self.geometry_recovery_s = rospy.get_param('~geometry_recovery_s', 0.5)
+        if not (all(math.isfinite(v) for v in (self.geometry_min_support, self.geometry_hold_s,
+                                              self.geometry_land_s, self.geometry_recovery_s)) and
+                self.geometry_min_support > 0 and
+                0 < self.geometry_hold_s < self.geometry_land_s and self.geometry_recovery_s > 0):
+            raise ValueError('Invalid LIO geometry protection durations')
         self.last_clock = rospy.Time(0)
         offset = rospy.get_param('~sensor_xyz_body', [0.27, 0.0, 0.10])
         pitch = math.radians(rospy.get_param('~sensor_pitch_deg', 30.0))
@@ -47,9 +64,14 @@ class LioBridge:
         self.odom_pub = rospy.Publisher('/drone/lio/odom', Odometry, queue_size=10)
         self.mavros_pub = rospy.Publisher('/mavros/odometry/out', Odometry, queue_size=10)
         self.cloud_pub = rospy.Publisher('/drone/cloud_world', PointCloud2, queue_size=2)
+        self.cloud_pose_pub = rospy.Publisher('/drone/cloud_body_pose', PoseStamped, queue_size=2)
         self.fcu_cloud_pub = rospy.Publisher('/drone/cloud_fcu_world', PointCloud2, queue_size=2)
         self.fcu_odom_pub = rospy.Publisher('/drone/fcu/odom', Odometry, queue_size=10)
         self.valid_pub = rospy.Publisher('/drone/lio/valid', Bool, queue_size=1, latch=True)
+        self.health_pub = rospy.Publisher('/drone/lio/health', String, queue_size=1, latch=True)
+        self.quality_pub = rospy.Publisher('/drone/lio/quality', String, queue_size=1, latch=True)
+        rospy.Subscriber('/faster_lio/translation_observability', Float64MultiArray,
+                         self.on_geometry, queue_size=10, tcp_nodelay=True)
         self.tf_pub = tf2_ros.TransformBroadcaster()
         rospy.Subscriber('/Odometry', Odometry, self.on_odom, queue_size=10)
         self.lio_poses = deque(maxlen=30)
@@ -66,11 +88,79 @@ class LioBridge:
             rospy.logerr('ROS clock moved backwards; bridge restart required after landing')
         self.last_clock = msg.clock
 
+    def on_geometry(self, msg):
+        with self.lock:
+            if len(msg.data) != 6 or not all(math.isfinite(v) for v in msg.data):
+                self.pose_fault = True
+                return
+            stamp = rospy.Time.from_sec(msg.data[0])
+            age = (rospy.Time.now()-stamp).to_nsec()/1e9
+            if stamp <= self.geometry_stamp or not -self.future_tolerance <= age <= self.max_age:
+                return
+            self.geometry_stamp = stamp
+            # Zero support / no matches is a severe observation failure.
+            if msg.data[1] <= 0 or msg.data[4] <= 0:
+                self.pose_fault = True
+                rospy.logerr('LIO geometry has no translation support or matches')
+                return
+            now = rospy.Time.now()
+            self.geometry_low = msg.data[1] < self.geometry_min_support
+            if self.geometry_low:
+                self.geometry_good_since = None
+                if self.geometry_low_since is None:
+                    self.geometry_low_since = now
+                    rospy.logwarn('LIO geometry warning: weakest support %.6f < %.6f',
+                                  msg.data[1], self.geometry_min_support)
+            else:
+                self.geometry_low_since = None
+                if self.geometry_good_since is None:
+                    self.geometry_good_since = now
+            self.update_geometry_quality(now)
+
+    def update_geometry_quality(self, now):
+        previous_quality = self.geometry_quality
+        geometry_age = (now-self.geometry_stamp).to_nsec()/1e9
+        if self.geometry_low_since is not None:
+            elapsed = (now-self.geometry_low_since).to_nsec()/1e9
+            if elapsed >= self.geometry_land_s:
+                if not self.pose_fault:
+                    rospy.logerr('LIO geometry weak for %.3f s; landing protection latched', elapsed)
+                self.pose_fault = True
+            elif elapsed >= self.geometry_hold_s:
+                self.geometry_quality = 'HOLD'
+            else:
+                self.geometry_quality = 'WARNING'
+        elif (self.geometry_good_since is not None and
+              (now-self.geometry_good_since).to_sec() >= self.geometry_recovery_s):
+            self.geometry_quality = 'HEALTHY'
+        if self.pose_fault:
+            self.geometry_quality = 'SEVERE'
+        elif self.geometry_stamp == rospy.Time(0) or not -self.future_tolerance <= geometry_age <= self.max_age:
+            self.geometry_quality = 'UNKNOWN'
+        if previous_quality != self.geometry_quality:
+            rospy.loginfo('LIO quality %s -> %s', previous_quality, self.geometry_quality)
+        return self.geometry_quality not in ('SEVERE', 'UNKNOWN')
+
     def on_health(self, _event):
-        age = (rospy.Time.now() - self.last_stamp).to_nsec()/1e9 if self.last_stamp != rospy.Time(0) else float('inf')
-        self.valid_pub.publish(Bool(data=not self.pose_fault and -self.future_tolerance <= age <= self.max_age))
+        with self.lock:
+            now = rospy.Time.now()
+            geometry_ok = self.update_geometry_quality(now)
+            age = (now - self.last_stamp).to_nsec()/1e9 if self.last_stamp != rospy.Time(0) else float('inf')
+            valid = geometry_ok and not self.pose_fault and -self.future_tolerance <= age <= self.max_age
+            snapshot = dict(stamp_ns=now.to_nsec(), pose_stamp_ns=self.last_stamp.to_nsec(),
+                            geometry_stamp_ns=self.geometry_stamp.to_nsec(), valid=valid,
+                            quality=self.geometry_quality, severe=self.pose_fault)
+            self.health_pub.publish(String(data=json.dumps(snapshot)))
+            # Legacy display topics originate from exactly the same snapshot.
+            self.quality_pub.publish(String(data=self.geometry_quality))
+            self.valid_pub.publish(Bool(data=valid))
 
     def on_odom(self, msg):
+        with self.lock:
+            self.process_odom(msg)
+
+    def process_odom(self, msg):
+        self.update_geometry_quality(rospy.Time.now())
         if self.pose_fault:
             return
         stamp = msg.header.stamp
@@ -88,10 +178,17 @@ class LioBridge:
         q = msg.pose.pose.orientation
         values = [p.x, p.y, p.z, q.x, q.y, q.z, q.w]
         if not all(math.isfinite(v) for v in values) or abs(sum(v * v for v in values[3:]) - 1.0) > 0.05:
+            self.pose_fault = True
             rospy.logerr_throttle(2.0, 'Rejected invalid Faster-LIO pose')
             return
         if not -self.future_tolerance <= (rospy.Time.now() - stamp).to_nsec()/1e9 <= self.max_age:
             rospy.logwarn_throttle(2.0, 'Rejected stale Faster-LIO pose')
+            return
+        native_covariance = np.asarray(msg.pose.covariance,dtype=float).reshape(6,6)[:3,:3]
+        if not np.isfinite(native_covariance).all() or np.trace(native_covariance) > 1e5:
+            self.pose_fault = True
+            self.valid_pub.publish(Bool(data=False))
+            rospy.logerr('LIO position observations are degenerate; bridge restart required after landing')
             return
         sensor_pose = concatenate_matrices(translation_matrix([p.x, p.y, p.z]),
                                            quaternion_matrix([q.x, q.y, q.z, q.w]))
@@ -228,6 +325,12 @@ class LioBridge:
         if lio_pose is None or fcu_pose is None:
             return
         fcu_from_lio = concatenate_matrices(fcu_pose, inverse_matrix(lio_pose))
+        cloud_pose = PoseStamped()
+        cloud_pose.header = copy.copy(out.header)
+        cloud_pose.pose.position.x, cloud_pose.pose.position.y, cloud_pose.pose.position.z = fcu_pose[:3, 3]
+        q = quaternion_from_matrix(fcu_pose)
+        cloud_pose.pose.orientation.x, cloud_pose.pose.orientation.y, cloud_pose.pose.orientation.z, cloud_pose.pose.orientation.w = q
+        self.cloud_pose_pub.publish(cloud_pose)
         self.fcu_cloud_pub.publish(self.transform_cloud(out, fcu_from_lio, 'odom'))
 
 

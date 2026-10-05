@@ -45,20 +45,169 @@ class Safety(unittest.TestCase):
         f.clock_fault=False;f.last_clock=rospy.Time(100)
         f.goal_min=[-8,-8,.5];f.goal_max=[8,8,2.5];f.max_takeoff_height=2
         f.goal_tolerance=.15;f.goal_speed_tolerance=.15
-        f.map_resolution=.1;f.map_origin=[-15,-15,.5];f.map_time=rospy.Time(100);f.occupied_cells=set()
-        f.max_map_age=2.0
+        f.map_shape=[300,300,80];f.map_resolution=.1;f.map_origin=[-15,-15,.5];f.map_time=rospy.Time(100);f.occupied_cells=set()
+        f.max_map_age=2.0;f.require_observed_free=False;f.observed_free=set();f.free_time=rospy.Time(0)
         f.max_traj_age=.5;f.max_setpoint_step=.75;f.max_command_speed=.75
         f.estimator=EstimatorStatus();f.estimator.header.stamp=rospy.Time(100)
         f.pending_estimator=None
         for flag in ['pos_horiz_rel_status_flag','pos_vert_abs_status_flag','velocity_horiz_status_flag','velocity_vert_status_flag']:
             setattr(f.estimator,flag,True)
+        f.approved_spline_id=4;f.pending_spline=None;f.approved_curve=None;f.prefix_check_time=rospy.Time(0);f.known_horizon=3.0
         f.latest_command_id=3;f.required_trajectory_id=4;f.pending_goal=None;f.active_goal=None
         f.enabled_pub=Mock();f.phase_pub=Mock();f.auth_pub=Mock();f.error_pub=Mock()
         f.setpoint_pub=Mock();f.hold_pose=f.copy_pose();f.trajectory=None;f.goal_reached_since=None
+        f.planner_time=rospy.Time(100);f.max_planner_age=.3
         f.goal_pub=Mock();f.goal_start=rospy.Time(100);f.trajectory_time=rospy.Time(0)
         f.future_command_since=None
         f.heartbeat_pub=Mock()
         f.arm_client=Mock(return_value=SimpleNamespace(success=True))
+
+    def test_planner_loss_stops_fresh_trajectory_without_waiting_for_traj_server(self):
+        self.navigate()
+        self.f.goal_start=rospy.Time(99)
+        self.f.planner_time=rospy.Time(99.69)
+        self.f.tick(None)
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIn('planner heartbeat',self.f.last_error)
+        self.f.setpoint_pub.publish.assert_called()
+
+    def test_future_duplicate_and_stale_planner_messages_cannot_refresh_health(self):
+        msg=SimpleNamespace(header=Header(stamp=rospy.Time(100)))
+        self.f.planner_time=rospy.Time(99.9)
+        self.f.on_planner_heartbeat(msg)
+        self.assertEqual(self.f.planner_time,rospy.Time(100))
+        for stamp in [100,100.001,99.95,99]:
+            msg.header.stamp=rospy.Time(stamp)
+            self.f.on_planner_heartbeat(msg)
+            self.assertEqual(self.f.planner_time,rospy.Time(100))
+
+    def test_new_goal_allows_bounded_planner_startup(self):
+        self.navigate();self.f.planner_time=rospy.Time(0)
+        self.f.tick(None)
+        self.assertEqual(self.f.phase,'NAVIGATING')
+
+    def test_command_waits_for_full_spline_approval(self):
+        self.navigate()
+        self.f.approved_spline_id=None
+        self.f.on_trajectory(self.command())
+        self.assertIsNone(self.f.trajectory)
+        self.assertEqual(self.f.phase,'NAVIGATING')
+
+    def test_whole_spline_voxel_collision_stops_before_execution(self):
+        from ego_planner.msg import Bspline
+        from geometry_msgs.msg import Point
+        self.navigate()
+        self.f.approved_spline_id=None
+        self.f.occupied_cells={self.f.map_cell([.5,0,1])}
+        b=Bspline(order=3,traj_id=4,start_time=rospy.Time(100),knots=[0,0,0,0,1,1,1,1],
+                  pos_pts=[Point(x=x,y=0,z=1) for x in [0,1/3,2/3,1]])
+        self.f.on_spline(b)
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIn('Full EGO trajectory',self.f.last_error)
+        self.assertIsNone(self.f.trajectory)
+
+    def test_clear_whole_spline_approves_matching_commands(self):
+        from ego_planner.msg import Bspline
+        from geometry_msgs.msg import Point
+        self.navigate()
+        self.f.approved_spline_id=None
+        b=Bspline(order=3,traj_id=4,start_time=rospy.Time(100),knots=[0,0,0,0,1,1,1,1],
+                  pos_pts=[Point(x=x,y=0,z=1) for x in [0,1/3,2/3,1]])
+        self.f.on_spline(b)
+        self.assertEqual(self.f.approved_spline_id,4)
+        self.f.on_trajectory(self.command())
+        self.assertIsNotNone(self.f.trajectory)
+
+    def spline(self, stamp):
+        from ego_planner.msg import Bspline
+        from geometry_msgs.msg import Point
+        return Bspline(order=3,traj_id=4,start_time=stamp,knots=[0,0,0,0,1,1,1,1],
+                       pos_pts=[Point(x=x,y=0,z=1) for x in [0,1/3,2/3,1]])
+
+    def test_future_spline_waits_for_clock_before_commands(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.on_spline(self.spline(rospy.Time(100,30000000)))
+        self.assertEqual(self.f.phase,'NAVIGATING')
+        self.assertIsNotNone(self.f.pending_spline)
+        self.f.on_trajectory(self.command())
+        self.assertIsNone(self.f.trajectory)
+        with patch('rospy.Time.now',return_value=rospy.Time(100,30000000)):
+            self.f.on_trajectory(self.command())
+        self.assertEqual(self.f.approved_spline_id,4)
+        self.assertIsNotNone(self.f.trajectory)
+
+    def test_far_future_spline_rejected(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.on_spline(self.spline(rospy.Time(101)))
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIn('age=',self.f.last_error)
+
+    def test_pending_spline_expired_before_activation_rejected(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.on_spline(self.spline(rospy.Time(100,30000000)))
+        self.f.odom.header.stamp=rospy.Time(101)
+        self.f.lio_health_time=rospy.Time(101)
+        self.f.estimator.header.stamp=rospy.Time(101)
+        with patch('rospy.Time.now',return_value=rospy.Time(101)):
+            self.f.activate_pending_spline()
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIsNone(self.f.approved_spline_id)
+
+    def test_pending_spline_never_activates_in_next_goal_generation(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.on_spline(self.spline(rospy.Time(100,30000000)))
+        self.f.required_trajectory_id=5
+        with patch('rospy.Time.now',return_value=rospy.Time(100,30000000)):
+            self.f.activate_pending_spline()
+        self.assertIsNone(self.f.approved_spline_id)
+        self.assertIsNone(self.f.pending_spline)
+
+    def test_pending_spline_requires_fresh_map_at_activation(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.on_spline(self.spline(rospy.Time(100,30000000)))
+        self.f.map_time=rospy.Time(97)
+        with patch('rospy.Time.now',return_value=rospy.Time(100,30000000)):
+            self.f.activate_pending_spline()
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIsNone(self.f.approved_spline_id)
+
+    def test_unknown_goal_queued_without_executing_unchecked_curve(self):
+        self.f.require_observed_free=True;self.f.free_time=rospy.Time(100)
+        self.assertTrue(self.f.local_goal(self.goal()).success)
+        self.assertEqual(self.f.phase,'NAVIGATING')
+        self.assertIsNone(self.f.trajectory)
+
+    def test_stale_free_map_rejects_goal(self):
+        self.f.require_observed_free=True;self.f.free_time=rospy.Time(97)
+        self.assertIn('fresh observed',self.f.local_goal(self.goal()).message)
+
+    def test_unknown_full_curve_rejected(self):
+        self.navigate();self.f.approved_spline_id=None
+        self.f.require_observed_free=True;self.f.free_time=rospy.Time(100)
+        self.f.on_spline(self.spline(rospy.Time(100)))
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIn('unobserved',self.f.last_error)
+
+    def test_lookahead_stops_before_unknown_future_motion(self):
+        from trajectory_guard import PackedCells
+        self.navigate();self.f.require_observed_free=True;self.f.free_time=rospy.Time(100)
+        self.f.approved_curve=self.spline(rospy.Time(100))
+        self.f.on_trajectory(self.command())
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertIsNone(self.f.trajectory)
+        self.assertIn('lookahead',self.f.last_error)
+
+    def test_lookahead_does_not_refresh_command_without_known_current_segment(self):
+        self.navigate();self.f.require_observed_free=True;self.f.free_time=rospy.Time(100)
+        self.f.approved_curve=self.spline(rospy.Time(100))
+        self.f.observed_free={(x,y,z) for x in range(149,161) for y in [149,150] for z in [4,5]}
+        self.f.on_trajectory(self.command())
+        self.assertIsNotNone(self.f.trajectory)
+        self.assertEqual(self.f.phase,'NAVIGATING')
+
+    def test_unknown_current_segment_rejected(self):
+        self.f.require_observed_free=True;self.f.free_time=rospy.Time(100)
+        self.assertIn('unobserved',self.f.command_error(self.command()))
 
     def goal(self,x=2,y=0,z=1,frame='odom'):
         p=PoseStamped();p.header.frame_id=frame;p.pose.position.x=x;p.pose.position.y=y;p.pose.position.z=z
@@ -220,6 +369,26 @@ class Safety(unittest.TestCase):
         self.f.tick(None);self.assertEqual(self.f.phase,'HOLD')
         self.f.setpoint_pub.publish.assert_called_once();self.f.error_pub.publish.assert_not_called()
 
+    def test_goal_arrival_holds_exact_goal_instead_of_remaining_error(self):
+        self.navigate();self.f.active_goal=self.goal(0,0,1).goal
+        self.f.odom.pose.pose.position.x=.09;self.f.odom.pose.pose.position.z=1.04
+        self.f.goal_reached_since=rospy.Time(98)
+        self.f.tick(None)
+        self.assertEqual(self.f.phase,'HOLD')
+        self.assertEqual(self.f.hold_pose.position.x,0)
+        self.assertEqual(self.f.hold_pose.position.z,1)
+        command=self.f.setpoint_pub.publish.call_args.args[0]
+        self.assertEqual(command.position.x,0);self.assertEqual(command.position.z,1)
+
+    def test_goal_arrival_rechecks_new_occupancy_before_holding_goal(self):
+        self.navigate();self.f.active_goal=self.goal(0,0,1).goal
+        self.f.occupied_cells={self.f.map_cell([0,0,1])}
+        self.f.goal_reached_since=rospy.Time(98);self.f.start_landing=Mock()
+        self.f.tick(None)
+        self.f.start_landing.assert_called_once()
+        self.assertIn('Goal holding segment is unsafe',self.f.start_landing.call_args.args[0])
+        self.f.setpoint_pub.publish.assert_not_called()
+
     def test_corner_tie_visits_side_voxels(self):
         self.f.map_origin=[0,0,0];self.f.map_resolution=1
         cells=set(self.f.segment_cells([.5,.5,.5],[1.5,1.5,1.5]))
@@ -359,6 +528,18 @@ class Safety(unittest.TestCase):
         self.f.extended.landed_state=ExtendedState.LANDED_STATE_ON_GROUND
         self.assertTrue(self.f.disarm(None).success)
         self.f.arm_client.assert_called_once_with(False)
+
+    def test_ground_contact_alone_does_not_complete_landing(self):
+        self.f.phase='LANDING'
+        self.f.extended.landed_state=ExtendedState.LANDED_STATE_ON_GROUND
+        self.f.tick(None)
+        self.assertEqual(self.f.phase,'LANDING')
+
+    def test_ground_landing_completes_only_after_disarming(self):
+        self.f.phase='LANDING';self.f.state.armed=False
+        self.f.extended.landed_state=ExtendedState.LANDED_STATE_ON_GROUND
+        self.f.tick(None)
+        self.assertEqual(self.f.phase,'READY')
 
     def test_invalid_takeoff_rejected(self):
         self.f.phase='ARMED'

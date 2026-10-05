@@ -26,7 +26,7 @@ topics=['/drone/lio/odom','/mavros/local_position/odom','/gazebo/model_states',
         '/mavros/state','/drone/flight_state','/drone/flight_error','/drone/lio/valid',
         '/planning/pos_cmd','/drone/front/detections','/drone/down/detections',
         '/clock','/drone/cloud_fcu_world','/grid_map/occupancy_inflate','/grid_map/occupancy_inflate_safety',
-        '/planning/bspline','/drone/planning_enabled','/move_base_simple/goal',
+        '/faster_lio/translation_observability','/Odometry','/planning/bspline','/drone/planning_enabled','/move_base_simple/goal',
         '/mavros/estimator_status','/mavros/timesync_status','/mavros/odometry/out',
         '/drone/manager_heartbeat','/mavros/extended_state']
 results=[]

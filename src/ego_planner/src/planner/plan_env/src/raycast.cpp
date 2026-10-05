@@ -1,5 +1,6 @@
 #include <Eigen/Eigen>
 #include <cmath>
+#include <limits>
 #include <iostream>
 #include <plan_env/raycast.h>
 
@@ -242,26 +243,24 @@ bool RayCaster::setInput(const Eigen::Vector3d& start,
   direction_ = (end_ - start_);
   maxDist_ = direction_.squaredNorm();
 
-  // Break out direction vector.
-  dx_ = endX_ - x_;
-  dy_ = endY_ - y_;
-  dz_ = endZ_ - z_;
-
-  // Direction to increment x,y,z when stepping.
-  stepX_ = (int)signum((int)dx_);
-  stepY_ = (int)signum((int)dy_);
-  stepZ_ = (int)signum((int)dz_);
-
-  // See description above. The initial values depend on the fractional
-  // part of the origin.
-  tMaxX_ = intbound(start_.x(), dx_);
-  tMaxY_ = intbound(start_.y(), dy_);
-  tMaxZ_ = intbound(start_.z(), dz_);
-
-  // The change in t when taking a step (always positive).
-  tDeltaX_ = ((double)stepX_) / dx_;
-  tDeltaY_ = ((double)stepY_) / dy_;
-  tDeltaZ_ = ((double)stepZ_) / dz_;
+  // Traverse the measured ray, not the vector between rounded voxel IDs.
+  // Rounding the direction marks adjacent cells free and misses real cells.
+  dx_ = direction_.x(); dy_ = direction_.y(); dz_ = direction_.z();
+  stepX_ = (dx_ > 0) - (dx_ < 0);
+  stepY_ = (dy_ > 0) - (dy_ < 0);
+  stepZ_ = (dz_ > 0) - (dz_ < 0);
+  const double infinity = std::numeric_limits<double>::infinity();
+  auto crossing = [infinity](double start, double direction) {
+    if (direction > 0) return (std::floor(start)+1.-start)/direction;
+    if (direction < 0) return (start-std::floor(start))/-direction;
+    return infinity;
+  };
+  tMaxX_ = crossing(start_.x(), dx_);
+  tMaxY_ = crossing(start_.y(), dy_);
+  tMaxZ_ = crossing(start_.z(), dz_);
+  tDeltaX_ = dx_ ? 1./std::abs(dx_) : infinity;
+  tDeltaY_ = dy_ ? 1./std::abs(dy_) : infinity;
+  tDeltaZ_ = dz_ ? 1./std::abs(dz_) : infinity;
 
   dist_ = 0;
 
@@ -293,29 +292,12 @@ bool RayCaster::step(Eigen::Vector3d& ray_pt) {
   //   return false;
   // }
 
-  // tMaxX stores the t-value at which we cross a cube boundary along the
-  // X axis, and similarly for Y and Z. Therefore, choosing the least tMax
-  // chooses the closest cube boundary. Only the first case of the four
-  // has been commented in detail.
-  if (tMaxX_ < tMaxY_) {
-    if (tMaxX_ < tMaxZ_) {
-      // Update which cube we are now in.
-      x_ += stepX_;
-      // Adjust tMaxX to the next X-oriented boundary crossing.
-      tMaxX_ += tDeltaX_;
-    } else {
-      z_ += stepZ_;
-      tMaxZ_ += tDeltaZ_;
-    }
-  } else {
-    if (tMaxY_ < tMaxZ_) {
-      y_ += stepY_;
-      tMaxY_ += tDeltaY_;
-    } else {
-      z_ += stepZ_;
-      tMaxZ_ += tDeltaZ_;
-    }
-  }
+  // A boundary tie advances all involved axes. Side cells touched only
+  // at a zero-length edge/corner must not receive a free-space vote.
+  const double next = std::min(tMaxX_, std::min(tMaxY_, tMaxZ_));
+  if (tMaxX_ <= next+1e-12) { x_ += stepX_; tMaxX_ += tDeltaX_; }
+  if (tMaxY_ <= next+1e-12) { y_ += stepY_; tMaxY_ += tDeltaY_; }
+  if (tMaxZ_ <= next+1e-12) { z_ += stepZ_; tMaxZ_ += tDeltaZ_; }
 
   return true;
 }

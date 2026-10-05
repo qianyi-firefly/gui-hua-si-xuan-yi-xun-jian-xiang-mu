@@ -58,6 +58,17 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/local_map_margin", mp_.local_map_margin_, 1);
   node_.param("grid_map/ground_height", mp_.ground_height_, 1.0);
 
+  node_.param("grid_map/require_observed_free", mp_.require_observed_free_, false);
+  std::vector<double> sensor_offset;
+  node_.param("grid_map/cloud_sensor_xyz_body", sensor_offset, std::vector<double>{0.0,0.0,0.0});
+  if (sensor_offset.size() != 3) throw std::runtime_error("cloud_sensor_xyz_body must have 3 entries");
+  mp_.cloud_sensor_offset_ = Eigen::Vector3d(sensor_offset[0], sensor_offset[1], sensor_offset[2]);
+  std::vector<double> body_half;
+  node_.param("grid_map/cloud_body_half_extent", body_half, std::vector<double>{0.0,0.0,0.0});
+  if (body_half.size()!=3) throw std::runtime_error("cloud_body_half_extent must have 3 entries");
+  mp_.cloud_body_half_extent_ = Eigen::Vector3d(body_half[0],body_half[1],body_half[2]);
+  if (!mp_.cloud_body_half_extent_.allFinite() || mp_.cloud_body_half_extent_.minCoeff()<0)
+    throw std::runtime_error("Invalid cloud body extent");
   mp_.resolution_inv_ = 1 / mp_.resolution_;
   mp_.map_origin_ = Eigen::Vector3d(-x_size / 2.0, -y_size / 2.0, mp_.ground_height_);
   mp_.map_size_ = Eigen::Vector3d(x_size, y_size, z_size);
@@ -87,6 +98,10 @@ void GridMap::initMap(ros::NodeHandle &nh)
 
   md_.occupancy_buffer_ = vector<double>(buffer_size, mp_.clamp_min_log_ - mp_.unknown_flag_);
   md_.occupancy_buffer_inflate_ = vector<char>(buffer_size, 0);
+  md_.cloud_observed_free_ = vector<char>(buffer_size, 0);
+  md_.cloud_evidence_.assign(buffer_size, 0);
+  md_.cloud_scan_flags_.assign(buffer_size, 0);
+  md_.cloud_inflate_refs_.assign(buffer_size, 0);
 
   md_.count_hit_and_miss_ = vector<short>(buffer_size, 0);
   md_.count_hit_ = vector<short>(buffer_size, 0);
@@ -125,18 +140,29 @@ void GridMap::initMap(ros::NodeHandle &nh)
   }
 
   // use odometry and point cloud
-  indep_cloud_sub_ =
-      node_.subscribe<sensor_msgs::PointCloud2>("/grid_map/cloud", 10, &GridMap::cloudCallback, this);
+  string cloud_pose_topic;
+  node_.param("grid_map/cloud_body_pose_topic", cloud_pose_topic, string(""));
+  if (cloud_pose_topic.empty()) {
+    if (mp_.require_observed_free_) throw std::runtime_error("Observed free rays require synchronized cloud pose");
+    indep_cloud_sub_ = node_.subscribe<sensor_msgs::PointCloud2>("/grid_map/cloud", 10, &GridMap::cloudCallback, this);
+  } else {
+    synced_cloud_sub_.reset(new message_filters::Subscriber<sensor_msgs::PointCloud2>(node_, "/grid_map/cloud", 5));
+    cloud_pose_sub_.reset(new message_filters::Subscriber<geometry_msgs::PoseStamped>(node_, cloud_pose_topic, 5));
+    cloud_pose_sync_.reset(new message_filters::TimeSynchronizer<sensor_msgs::PointCloud2, geometry_msgs::PoseStamped>(
+        *synced_cloud_sub_, *cloud_pose_sub_, 5));
+    cloud_pose_sync_->registerCallback(boost::bind(&GridMap::cloudPoseCallback, this, _1, _2));
+  }
   indep_odom_sub_ =
       node_.subscribe<nav_msgs::Odometry>("/grid_map/odom", 10, &GridMap::odomCallback, this);
 
   occ_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::updateOccupancyCallback, this);
   vis_timer_ = node_.createTimer(ros::Duration(0.05), &GridMap::visCallback, this);
 
-  map_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy", 10);
-  map_inf_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate", 1);
-  map_inf_safety_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate_safety", 1);
+  map_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy", 1, true);
+  map_inf_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate", 1, true);
+  map_inf_safety_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate_safety", 1, true);
 
+  observed_free_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/observed_free", 1, true);
   unknown_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/unknown", 10);
 
   md_.occ_need_update_ = false;
@@ -145,6 +171,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
   md_.has_odom_ = false;
   md_.has_cloud_ = false;
   md_.last_observation_stamp_ = ros::Time(0);
+  md_.last_published_stamp_ = ros::Time(0);
   md_.pending_depth_stamp_ = ros::Time(0);
   md_.local_bound_min_ = Eigen::Vector3i::Zero();
   md_.local_bound_max_ = Eigen::Vector3i::Zero();
@@ -167,6 +194,7 @@ void GridMap::resetBuffer()
 
   resetBuffer(min_pos, max_pos);
   md_.last_observation_stamp_ = ros::Time(0);
+  md_.last_published_stamp_ = ros::Time(0);
 
   md_.local_bound_min_ = Eigen::Vector3i::Zero();
   md_.local_bound_max_ = mp_.map_voxel_num_ - Eigen::Vector3i::Ones();
@@ -188,6 +216,10 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
       for (int z = min_id(2); z <= max_id(2); ++z)
       {
         md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
+        md_.cloud_observed_free_[toAddress(x, y, z)] = 0;
+        md_.cloud_evidence_[toAddress(x, y, z)] = 0;
+        md_.cloud_scan_flags_[toAddress(x, y, z)] = 0;
+        md_.cloud_inflate_refs_[toAddress(x, y, z)] = 0;
       }
 }
 
@@ -663,8 +695,14 @@ void GridMap::addVirtualCeiling()
 void GridMap::visCallback(const ros::TimerEvent & /*event*/)
 {
 
+  // One snapshot per incorporated observation. Latched publishers give late
+  // subscribers the same snapshot, without refreshing its acquisition time.
+  if (md_.last_observation_stamp_.isZero() ||
+      md_.last_observation_stamp_ == md_.last_published_stamp_)
+    return;
   publishMap();
   publishMapInflate(true);
+  md_.last_published_stamp_ = md_.last_observation_stamp_;
 }
 
 void GridMap::updateOccupancyCallback(const ros::TimerEvent & /*event*/)
@@ -768,8 +806,24 @@ void GridMap::cloudMemoryStartCallback(const std_msgs::StringConstPtr& state)
   resetBuffer();
   md_.has_cloud_ = false;
   md_.last_observation_stamp_ = ros::Time(0);
+  md_.last_published_stamp_ = ros::Time(0);
   cloud_memory_started_ = true;
   ROS_INFO("Static cloud memory started after localization became READY");
+}
+
+void GridMap::cloudPoseCallback(const sensor_msgs::PointCloud2ConstPtr& cloud,
+                                 const geometry_msgs::PoseStampedConstPtr& pose)
+{
+  if (pose->header.frame_id != mp_.frame_id_) return;
+  const auto& p = pose->pose.position;
+  const auto& q = pose->pose.orientation;
+  Eigen::Vector3d position(p.x,p.y,p.z);
+  Eigen::Quaterniond rotation(q.w,q.x,q.y,q.z);
+  if (!position.allFinite() || !rotation.coeffs().allFinite() || std::abs(rotation.norm()-1.0) > .025) return;
+  md_.camera_pos_ = position;
+  md_.camera_q_ = rotation.normalized();
+  md_.has_odom_ = true;
+  cloudCallback(cloud);
 }
 
 void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
@@ -804,74 +858,89 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
   if (!has_finite_point)
     return;
 
-  // A point absent from the next scan may be occluded or outside the tilted
-  // lidar's field of view. Without a free-space ray observation, deleting its
-  // occupied voxel makes blind return flights unsafe. Static inspection maps
-  // retain occupied cells; upstream replacement behaviour stays configurable.
-  if (!mp_.retain_cloud_obstacles_ || !cloud_memory_started_)
-    this->resetBuffer(md_.camera_pos_ - mp_.local_update_range_,
-                      md_.camera_pos_ + mp_.local_update_range_);
+  // Missing returns alone never clear a blind/occluded obstacle. Only rays
+  // actually traversing its raw voxel can remove evidence. Non-memory mode
+  // rebuilds from this scan; resetting all buffers keeps reference counts exact.
+  if (!mp_.retain_cloud_obstacles_ || !cloud_memory_started_) resetBuffer();
 
-  pcl::PointXYZ pt;
-  Eigen::Vector3d p3d, p3d_inf;
-
-  int inf_step = ceil(mp_.obstacles_inflation_ / mp_.resolution_);
-  int inf_step_z = ceil(mp_.obstacles_inflation_z_ / mp_.resolution_);
-
-  double max_x, max_y, max_z, min_x, min_y, min_z;
-
-  min_x = mp_.map_max_boundary_(0);
-  min_y = mp_.map_max_boundary_(1);
-  min_z = mp_.map_max_boundary_(2);
-
-  max_x = mp_.map_min_boundary_(0);
-  max_y = mp_.map_min_boundary_(1);
-  max_z = mp_.map_min_boundary_(2);
-
-  for (size_t i = 0; i < latest_cloud.points.size(); ++i)
-  {
-    pt = latest_cloud.points[i];
-    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
-      continue;
-    p3d(0) = pt.x, p3d(1) = pt.y, p3d(2) = pt.z;
-
-    /* point inside update range */
-    Eigen::Vector3d devi = p3d - md_.camera_pos_;
-    Eigen::Vector3i inf_pt;
-
-    if (fabs(devi(0)) < mp_.local_update_range_(0) && fabs(devi(1)) < mp_.local_update_range_(1) &&
-        fabs(devi(2)) < mp_.local_update_range_(2))
-    {
-
-      /* inflate the point */
-      for (int x = -inf_step; x <= inf_step; ++x)
-        for (int y = -inf_step; y <= inf_step; ++y)
-          for (int z = -inf_step_z; z <= inf_step_z; ++z)
-          {
-
-            p3d_inf(0) = pt.x + x * mp_.resolution_;
-            p3d_inf(1) = pt.y + y * mp_.resolution_;
-            p3d_inf(2) = pt.z + z * mp_.resolution_;
-
-            max_x = max(max_x, p3d_inf(0));
-            max_y = max(max_y, p3d_inf(1));
-            max_z = max(max_z, p3d_inf(2));
-
-            min_x = min(min_x, p3d_inf(0));
-            min_y = min(min_y, p3d_inf(1));
-            min_z = min(min_z, p3d_inf(2));
-
-            posToIndex(p3d_inf, inf_pt);
-
-            if (!isInMap(inf_pt))
-              continue;
-
-            int idx_inf = toAddress(inf_pt);
-
-            md_.occupancy_buffer_inflate_[idx_inf] = 1;
-          }
+  std::vector<int> touched;
+  auto observe = [&](const Eigen::Vector3i& id, unsigned char flag) {
+    if (!isInMap(id)) return;
+    const int adr = toAddress(id);
+    if (!md_.cloud_scan_flags_[adr]) touched.push_back(adr);
+    md_.cloud_scan_flags_[adr] |= flag;
+  };
+  // Register every hit first. A hit wins over every other beam's miss in the
+  // same scan, and each voxel receives only one evidence update per scan.
+  for (const auto& point : latest_cloud.points) {
+    Eigen::Vector3d end(point.x, point.y, point.z);
+    if (!end.allFinite()) continue;
+    Eigen::Vector3i id; posToIndex(end, id);
+    observe(id, 1);
+  }
+  const Eigen::Vector3d origin = md_.camera_pos_ + md_.camera_q_ * mp_.cloud_sensor_offset_;
+  RayCaster raycaster;
+  for (const auto& point : latest_cloud.points) {
+    Eigen::Vector3d end(point.x, point.y, point.z);
+    if (!end.allFinite()) continue;
+    const double length = (end-origin).norm();
+    if (length <= 0 || length > 40.0) continue;
+    if (!raycaster.setInput(origin/mp_.resolution_, end/mp_.resolution_)) continue;
+    Eigen::Vector3d ray;
+    while (raycaster.step(ray)) {
+      const Eigen::Vector3d center = (ray+Eigen::Vector3d::Constant(.5))*mp_.resolution_;
+      // Preserve a small band around the return, avoiding surface erosion
+      // from voxel quantisation. Never extend free rays behind a return.
+      if ((center-end).norm() <= 1.5*mp_.resolution_) continue;
+      Eigen::Vector3i id; posToIndex(center, id);
+      observe(id, 2);
     }
   }
+  // Physical body volume is known free, including its near-field blind zone.
+  Eigen::Vector3d half = md_.camera_q_.toRotationMatrix().cwiseAbs()*mp_.cloud_body_half_extent_;
+  Eigen::Vector3i body_min, body_max;
+  posToIndex(md_.camera_pos_-half, body_min); posToIndex(md_.camera_pos_+half, body_max);
+  boundIndex(body_min); boundIndex(body_max);
+  for (int x=body_min.x(); x<=body_max.x(); ++x)
+    for (int y=body_min.y(); y<=body_max.y(); ++y)
+      for (int z=body_min.z(); z<=body_max.z(); ++z)
+        observe(Eigen::Vector3i(x,y,z), 2);
+
+  const int inf_step = ceil(mp_.obstacles_inflation_/mp_.resolution_);
+  const int inf_step_z = ceil(mp_.obstacles_inflation_z_/mp_.resolution_);
+  for (const int adr : touched) {
+    const unsigned char flags = md_.cloud_scan_flags_[adr];
+    md_.cloud_scan_flags_[adr] = 0;
+    const unsigned char previous = md_.cloud_evidence_[adr];
+    // First hit blocks immediately for safety. Repeated scans confirm it;
+    // 2-3 independent free scans remove it. Many rays in one scan cannot.
+    const unsigned char next = (flags & 1) ? std::min(3, int(previous)+2) :
+                              (previous ? previous-1 : 0);
+    md_.cloud_evidence_[adr] = next;
+    if (flags & 1) md_.cloud_observed_free_[adr] = 0;
+    else md_.cloud_observed_free_[adr] = 1;
+    if (bool(previous) == bool(next)) continue;
+    const int z0 = adr % mp_.map_voxel_num_(2);
+    const int y0 = (adr/mp_.map_voxel_num_(2)) % mp_.map_voxel_num_(1);
+    const int x0 = adr/(mp_.map_voxel_num_(2)*mp_.map_voxel_num_(1));
+    for (int x=std::max(0,x0-inf_step); x<=std::min(mp_.map_voxel_num_(0)-1,x0+inf_step); ++x)
+      for (int y=std::max(0,y0-inf_step); y<=std::min(mp_.map_voxel_num_(1)-1,y0+inf_step); ++y)
+        for (int z=std::max(0,z0-inf_step_z); z<=std::min(mp_.map_voxel_num_(2)-1,z0+inf_step_z); ++z) {
+          const int inflated = toAddress(x,y,z);
+          auto& count = md_.cloud_inflate_refs_[inflated];
+          if (next) ++count;
+          else if (count) --count;
+          md_.occupancy_buffer_inflate_[inflated] = count > 0;
+        }
+  }
+  // Reference counts produce exactly the union of CURRENT raw occupied
+  // voxels' inflation boxes, updating only boxes affected by raw changes.
+  double min_x = md_.camera_pos_(0)-mp_.local_update_range_(0);
+  double min_y = md_.camera_pos_(1)-mp_.local_update_range_(1);
+  double min_z = md_.camera_pos_(2)-mp_.local_update_range_(2);
+  double max_x = md_.camera_pos_(0)+mp_.local_update_range_(0);
+  double max_y = md_.camera_pos_(1)+mp_.local_update_range_(1);
+  double max_z = md_.camera_pos_(2)+mp_.local_update_range_(2);
 
   min_x = min(min_x, md_.camera_pos_(0));
   min_y = min(min_y, md_.camera_pos_(1));
@@ -949,13 +1018,14 @@ void GridMap::publishMap()
 void GridMap::publishMapInflate(bool all_info)
 {
 
-  const bool publish_visual = map_inf_pub_.getNumSubscribers() > 0;
-  const bool publish_safety = map_inf_safety_pub_.getNumSubscribers() > 0;
-  if (!publish_visual && !publish_safety)
+  const bool publish_visual = true; // populate the latched snapshot
+  const bool publish_safety = true;
+  const bool publish_free = mp_.require_observed_free_;
+  if (!publish_visual && !publish_safety && !publish_free)
     return;
 
   pcl::PointXYZ pt;
-  pcl::PointCloud<pcl::PointXYZ> cloud, safety_cloud;
+  pcl::PointCloud<pcl::PointXYZ> cloud, safety_cloud, free_cloud;
 
   Eigen::Vector3i min_cut = md_.local_bound_min_;
   Eigen::Vector3i max_cut = md_.local_bound_max_;
@@ -979,7 +1049,13 @@ void GridMap::publishMapInflate(bool all_info)
     for (int y = min_cut(1); y <= max_cut(1); ++y)
       for (int z = min_cut(2); z <= max_cut(2); ++z)
       {
-        if (md_.occupancy_buffer_inflate_[toAddress(x, y, z)] == 0)
+        const int address = toAddress(x, y, z);
+        if (publish_free && md_.cloud_observed_free_[address] && !md_.occupancy_buffer_inflate_[address]) {
+          Eigen::Vector3d free_pos;
+          indexToPos(Eigen::Vector3i(x,y,z),free_pos);
+          free_cloud.push_back(pcl::PointXYZ(free_pos(0),free_pos(1),free_pos(2)));
+        }
+        if (md_.occupancy_buffer_inflate_[address] == 0)
           continue;
 
         Eigen::Vector3d pos;
@@ -1010,6 +1086,10 @@ void GridMap::publishMapInflate(bool all_info)
         safety_cloud, md_.last_observation_stamp_, mp_.frame_id_));
   }
 
+  if (publish_free) {
+    free_cloud.width=free_cloud.points.size(); free_cloud.height=1; free_cloud.is_dense=true;
+    observed_free_pub_.publish(plan_env::makeMapMessage(free_cloud, md_.last_observation_stamp_, mp_.frame_id_));
+  }
   // ROS_INFO("pub map");
 }
 

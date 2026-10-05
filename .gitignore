@@ -28,3 +28,7 @@
 # Editor and OS files
 .DS_Store
 Thumbs.db
+
+# Local Qt experiments, runtime traces and source backups
+/start/qt_work/
+/start/cleanup_records/

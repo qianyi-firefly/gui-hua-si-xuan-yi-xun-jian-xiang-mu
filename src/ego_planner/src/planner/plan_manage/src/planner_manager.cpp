@@ -1,6 +1,7 @@
 // #include <fstream>
 #include <plan_manage/planner_manager.h>
 #include <thread>
+#include <bspline_opt/trajectory_collision.h>
 
 namespace ego_planner
 {
@@ -72,7 +73,31 @@ namespace ego_planner
       start_end_derivatives.clear();
       flag_regenerate = false;
 
-      if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
+      if (!route_seed_.empty())
+      {
+        // Seed the optimizer from the ACTUAL global curve, including its
+        // rounded bends. Boundary derivatives remain the live local state,
+        // so replans retain velocity/acceleration continuity.
+        vector<Eigen::Vector3d> reference;reference.push_back(start_pt);
+        for(const auto& p:route_seed_)
+          if((p-reference.back()).norm()>1e-6) reference.push_back(p);
+        if((reference.back()-local_target_pt).norm()>1e-6) reference.push_back(local_target_pt);
+        vector<double> arc(reference.size(),0.);
+        for(size_t i=1;i<reference.size();++i) arc[i]=arc[i-1]+(reference[i]-reference[i-1]).norm();
+        if(arc.back()<.05) return false;
+        const int samples=std::max(8,std::min(128,int(std::ceil(arc.back()/(pp_.ctrl_pt_dist*.5)))+1));
+        ts=arc.back()/std::max(.1,pp_.max_vel_)/(samples-1);
+        size_t segment=0;
+        for(int i=0;i<samples;++i) {
+          const double length=arc.back()*i/(samples-1);
+          while(segment+1<arc.size()-1 && arc[segment+1]<length) ++segment;
+          const double fraction=(length-arc[segment])/std::max(1e-9,arc[segment+1]-arc[segment]);
+          point_set.push_back(reference[segment]+fraction*(reference[segment+1]-reference[segment]));
+        }
+        start_end_derivatives={start_vel,local_target_vel,start_acc,Eigen::Vector3d::Zero()};
+        flag_first_call=false;flag_force_polynomial=false;
+      }
+      else if (flag_first_call || flag_polyInit || flag_force_polynomial /*|| ( start_pt - local_target_pt ).norm() < 1.0*/) // Initial path generated from a min-snap traj by order.
       {
         flag_first_call = false;
         flag_force_polynomial = false;
@@ -223,6 +248,7 @@ namespace ego_planner
     t_start = ros::Time::now();
 
     /*** STEP 2: OPTIMIZE ***/
+    bspline_optimizer_rebound_->global_reference_pts_ = route_seed_.empty() ? vector<Eigen::Vector3d>() : point_set;
     bool flag_step_1_success = bspline_optimizer_rebound_->BsplineOptimizeTrajRebound(ctrl_pts, ts);
     cout << "first_optimize_step_success=" << flag_step_1_success << endl;
     if (!flag_step_1_success)
@@ -260,6 +286,14 @@ namespace ego_planner
     }
 
     t_refine = ros::Time::now() - t_start;
+
+    double collision_time=0.;
+    if (!continuousTrajectoryFree(pos,grid_map_,collision_time,0.05))
+    {
+      ROS_WARN("Rejecting complete candidate curve before publication, t=%.6f",collision_time);
+      continous_failures_count_++;
+      return false;
+    }
 
     // save planned results
     updateTrajInfo(pos, ros::Time::now());

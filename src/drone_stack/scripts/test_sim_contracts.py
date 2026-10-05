@@ -36,13 +36,22 @@ class Contracts(unittest.TestCase):
         b.sensor_base=np.linalg.inv(b.base_sensor)
         b.pose_cov=[.0025,.0025,.0025,.01,.01,.0025]
         b.lio_poses=deque(maxlen=30); b.fcu_poses=deque(maxlen=100)
-        for name in ['odom_pub','mavros_pub','cloud_pub','fcu_cloud_pub','fcu_odom_pub','valid_pub','tf_pub']:
+        for name in ['odom_pub','mavros_pub','cloud_pub','cloud_pose_pub','fcu_cloud_pub','fcu_odom_pub','valid_pub','tf_pub']:
             setattr(b,name,Mock())
 
     def observation(self):
         msg=Odometry();msg.header.frame_id='camera_init';msg.header.stamp=rospy.Time(100)
         msg.pose.pose.orientation.w=1
         return msg
+
+    def test_degenerate_native_covariance_stops_external_pose(self):
+        m=self.observation();m.pose.covariance[14]=1e6
+        self.b.on_odom(m)
+        self.assertTrue(self.b.pose_fault)
+        self.assertFalse(self.b.valid_pub.publish.call_args.args[0].data)
+        self.b.mavros_pub.publish.assert_not_called()
+        self.b.on_odom(self.observation())
+        self.b.mavros_pub.publish.assert_not_called()
 
     def test_clock_regression_latches_bridge_fault(self):
         from rosgraph_msgs.msg import Clock
@@ -193,11 +202,25 @@ class Contracts(unittest.TestCase):
         expected=fcu@np.linalg.inv(lio)@np.r_[point,1]
         np.testing.assert_allclose(list(point_cloud2.read_points(out,field_names=('x','y','z')))[0],expected[:3],atol=1e-6)
         self.assertEqual(out.header.stamp,msg.header.stamp);self.assertEqual(out.header.frame_id,'odom')
+        paired=self.b.cloud_pose_pub.publish.call_args.args[0]
+        self.assertEqual(paired.header.stamp,out.header.stamp)
+        self.assertEqual(paired.header.frame_id,out.header.frame_id)
+        np.testing.assert_allclose([paired.pose.position.x,paired.pose.position.y,paired.pose.position.z],fcu[:3,3])
 
     def test_unsynchronized_cloud_not_sent_to_planner(self):
         self.b.last_stamp=rospy.Time(100)
         msg=point_cloud2.create_cloud_xyz32(Header(stamp=rospy.Time(100),frame_id='camera_init'),[(1,0,0)])
         self.b.on_cloud(msg);self.b.fcu_cloud_pub.publish.assert_not_called()
+
+    def test_free_space_body_extent_matches_sim_body(self):
+        node=self.model.find(".//link[@name='base_link']/collision[@name='base_link_inertia_collision']/geometry/box/size")
+        size=np.array([float(v) for v in node.text.split()])
+        tree=ET.parse(ROOT/'launch/ego.launch')
+        import yaml
+        extent=yaml.safe_load(tree.find("rosparam[@param='/ego_planner_node/grid_map/cloud_body_half_extent']").text)
+        np.testing.assert_allclose(size,2*np.array(extent))
+        config=yaml.safe_load((ROOT/'config/faster_lio_sim.yaml').read_text())
+        self.assertTrue(config['publish']['dense_publish_en'])
 
     def test_camera_optical_axes(self):
         tree=ET.parse(ROOT/'launch/cameras.launch')

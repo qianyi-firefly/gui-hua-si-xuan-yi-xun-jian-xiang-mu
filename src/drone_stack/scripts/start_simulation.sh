@@ -24,13 +24,21 @@ cp -a "$project_root/src/ego_planner/src/planner/plan_env/src/grid_map.cpp" \
       "$project_root/src/ego_planner/src/planner/plan_env/CMakeLists.txt" \
       "$log_dir/source_snapshot/ego_plan_env/"
 sha256sum "$project_root/devel/lib/libplan_env.so" \
+          "$project_root/devel/lib/libbspline_opt.so" \
+          "$project_root/devel/lib/libpath_searching.so" \
+          "$project_root/devel/lib/libtraj_utils.so" \
+          "$project_root/devel/lib/ego_planner/traj_server" \
           "$project_root/devel/lib/ego_planner/ego_planner_node" \
           > "$log_dir/source_snapshot/ego_binaries.sha256"
+sha256sum "$project_root/external/PX4-Autopilot/build/px4_sitl_inspection/build_gazebo-classic/libgazebo_imu_plugin.so" \
+          > "$log_dir/source_snapshot/gazebo_imu_binary.sha256"
 mkdir -p "$log_dir/source_snapshot/faster_lio"
 cp -a "$project_root/src/faster_lio_main/src" "$project_root/src/faster_lio_main/include" \
       "$project_root/src/faster_lio_main/CMakeLists.txt" "$project_root/src/faster_lio_main/package.xml" \
       "$log_dir/source_snapshot/faster_lio/"
 sha256sum "$project_root/devel/lib/faster_lio/run_mapping_online" \
+          "$project_root/devel/lib/libfaster_lio.so" \
+          "$project_root/external/PX4-Autopilot/build/px4_sitl_inspection/bin/px4" \
           > "$log_dir/source_snapshot/faster_lio_binary.sha256"
 ln -sfn "$log_dir" "$project_root/start/logs/latest"
 if pgrep -f "^gzserver $project_root/src/drone_stack/worlds/inspection_demo.world" >/dev/null; then

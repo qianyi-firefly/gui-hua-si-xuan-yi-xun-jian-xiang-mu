@@ -12,7 +12,9 @@ find_package(PCL 1.7 REQUIRED)
 find_package(catkin REQUIRED COMPONENTS
   roscpp
   std_msgs
+  std_srvs
   geometry_msgs
+  nav_msgs
   quadrotor_msgs
   plan_env
   path_searching
@@ -27,13 +29,17 @@ add_message_files(
   FILES
   Bspline.msg
   DataDisp.msg
+  GlobalRoute.msg
   )
   
+add_service_files(FILES StartPlanning.srv)
+
 # Generate added messages and services with any dependencies listed here
 generate_messages(
   DEPENDENCIES
   std_msgs
   geometry_msgs
+  nav_msgs
 )
 
 # catkin_package(CATKIN_DEPENDS message_runtime)
@@ -66,5 +72,3 @@ add_dependencies(ego_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS})
 add_executable(traj_server src/traj_server.cpp)
 target_link_libraries(traj_server ${catkin_LIBRARIES})
 add_dependencies(traj_server ${${PROJECT_NAME}_EXPORTED_TARGETS})
-
-

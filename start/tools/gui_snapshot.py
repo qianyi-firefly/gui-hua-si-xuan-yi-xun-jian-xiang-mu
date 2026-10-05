@@ -7,8 +7,16 @@ import pyatspi
 
 
 def widgets():
+    # Desktop retains registrations from terminated Qt applications. Bound
+    # their D-Bus queries so a dead application cannot stall a live audit.
+    pyatspi.Accessibility.setTimeout(500, 2000)
     desktop=pyatspi.Registry.getDesktop(0)
-    apps=[a for a in desktop if a.name=='drone_operator_gui']
+    apps=[]
+    for candidate in desktop:
+        try:
+            if candidate.name=='drone_operator_gui':apps.append(candidate)
+        except Exception:
+            continue
     # Qt can register an empty application object before activating its
     # populated AT-SPI tree. Both objects refer to the same live process.
     if not apps:
@@ -62,11 +70,12 @@ def click_land():
     if len(matches)!=1 or not matches[0]['enabled']:
         raise RuntimeError('Landing button missing or disabled')
     action=matches[0]['object'].queryAction()
-    for i in range(action.nActions):
-        if action.getName(i) in ('press','click'):
+    names=[action.getName(i) for i in range(action.nActions)]
+    for i,name in enumerate(names):
+        if name.casefold() in ('press','click'):
             if not action.doAction(i):raise RuntimeError('GUI rejected landing action')
             return {'activated':True,'action':action.getName(i)}
-    raise RuntimeError('No accessible landing action')
+    raise RuntimeError('No accessible landing action: '+repr(names))
 
 
 if __name__=='__main__':

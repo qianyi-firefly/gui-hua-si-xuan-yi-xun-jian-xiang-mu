@@ -48,6 +48,23 @@ class GUIChecks(unittest.TestCase):
         with patch.object(gui_snapshot,'widgets',return_value=self.buttons(True)):
             self.assertFalse(gui_snapshot.snapshot('fcu_stale')['passed'])
 
+    def test_qt_capitalized_press_action_is_exercised(self):
+        action=MagicMock();action.nActions=1;action.getName.return_value='Press'
+        action.doAction.return_value=True
+        widget=MagicMock();widget.queryAction.return_value=action
+        entries=[{'name':'一键降落','role':'push button','enabled':True,'object':widget}]
+        with patch.object(gui_snapshot,'widgets',return_value=entries):
+            self.assertTrue(gui_snapshot.click_land()['activated'])
+        action.doAction.assert_called_once_with(0)
+
+    def test_unknown_action_cannot_certify_click(self):
+        action=MagicMock();action.nActions=1;action.getName.return_value='toggle'
+        widget=MagicMock();widget.queryAction.return_value=action
+        entries=[{'name':'一键降落','role':'push button','enabled':True,'object':widget}]
+        with patch.object(gui_snapshot,'widgets',return_value=entries):
+            with self.assertRaisesRegex(RuntimeError,'toggle'):gui_snapshot.click_land()
+        action.doAction.assert_not_called()
+
     def test_no_accessibility_tree_cannot_certify_gui(self):
         with patch.object(gui_snapshot,'widgets',return_value=[]):
             r=gui_snapshot.snapshot('protection')

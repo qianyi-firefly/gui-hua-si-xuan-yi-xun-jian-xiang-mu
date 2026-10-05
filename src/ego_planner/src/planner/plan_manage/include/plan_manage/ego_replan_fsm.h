@@ -16,6 +16,9 @@
 #include <plan_env/grid_map.h>
 #include <ego_planner/Bspline.h>
 #include <ego_planner/DataDisp.h>
+#include <std_srvs/Trigger.h>
+#include <ego_planner/StartPlanning.h>
+#include <ego_planner/GlobalRoute.h>
 #include <plan_manage/planner_manager.h>
 #include <traj_utils/planning_visualization.h>
 
@@ -61,6 +64,14 @@ namespace ego_planner
     /* planning data */
     bool trigger_, have_target_, have_odom_, have_new_target_;
     bool planning_enabled_{false};
+    bool prepared_start_{false};
+    uint64_t session_generation_{0};
+    bool use_global_route_{false};
+    uint64_t route_sequence_{0};
+    ros::Time route_stamp_;
+    vector<Eigen::Vector3d> route_points_;
+    ros::Time odom_stamp_;
+    ros::Time last_failed_plan_;
     FSM_EXEC_STATE exec_state_;
     int continously_called_times_{0};
 
@@ -77,7 +88,10 @@ namespace ego_planner
     /* ROS utils */
     ros::NodeHandle node_;
     ros::Timer exec_timer_, safety_timer_;
+    ros::ServiceServer speed_service_, start_service_;
     ros::Subscriber waypoint_sub_, odom_sub_, planning_enabled_sub_;
+    ros::Subscriber global_route_sub_;
+    ros::Publisher local_target_pub_;
     ros::Publisher replan_pub_, new_pub_, bspline_pub_, data_disp_pub_;
 
     /* helper functions */
@@ -91,7 +105,13 @@ namespace ego_planner
     void printFSMExecState();
 
     void planGlobalTrajbyGivenWps();
-    void getLocalTarget();
+    bool getLocalTarget();
+    bool getRouteTarget();
+    bool installRoute(const nav_msgs::Path &);
+    void globalRouteCallback(const ego_planner::GlobalRouteConstPtr &);
+    void clearLocalPlan();
+    bool startPlanningCallback(ego_planner::StartPlanning::Request&, ego_planner::StartPlanning::Response&);
+    bool applySpeedCallback(std_srvs::Trigger::Request&, std_srvs::Trigger::Response&);
 
     /* ROS functions */
     void execFSMCallback(const ros::TimerEvent &e);

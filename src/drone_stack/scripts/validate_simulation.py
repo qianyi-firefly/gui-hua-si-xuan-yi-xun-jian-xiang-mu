@@ -148,6 +148,8 @@ elif mode=='hold_check':
         call('/drone/land',Trigger)
         raise RuntimeError('Hover stability or LIO consistency failed')
 elif mode=='land':
+    if not d['state'].connected:
+        raise RuntimeError('Cannot verify disarming through disconnected MAVROS')
     if not d['state'].armed:
         grounded=truth()[2]<.25
         output({'armed':False,'skipped':True,'passed':bool(grounded),'truth':truth().tolist()})
@@ -168,7 +170,7 @@ elif mode=='land':
     positions=np.array([r['truth'] for r in records]+[truth().tolist()])
     rise=float(max(0,positions[:,2].max()-start[2]))
     drift=float(np.linalg.norm(positions[:,:2]-start[:2],axis=1).max())
-    passed=not d['state'].armed and rise<=.15 and drift<=.30
+    passed=d['state'].connected and not d['state'].armed and truth()[2]<.25 and rise<=.15 and drift<=.30
     output({'armed':d['state'].armed,'phase':phase_name(),'truth':truth().tolist(),
             'max_rise_m':rise,'max_horizontal_drift_m':drift,'passed':passed,'trace':records})
     if not passed:raise RuntimeError('Landing path failed acceptance')

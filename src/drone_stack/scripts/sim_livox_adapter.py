@@ -21,8 +21,10 @@ class Adapter:
         self.startup_settle = rospy.get_param('~startup_settle_s', 2.0)
         self.drop_lidar = False
         self.drop_imu = False
+        self.geometry_loss = False
         rospy.Service('/drone/sim/faults/lidar', SetBool, self.set_lidar_fault)
         rospy.Service('/drone/sim/faults/imu', SetBool, self.set_imu_fault)
+        rospy.Service('/drone/sim/faults/lidar_geometry', SetBool, self.set_geometry_fault)
         rospy.Subscriber('/drone/sim/lidar/imu_raw', Imu, self.on_imu, queue_size=100)
         self.step = max(1, rospy.get_param('~sample_step', 1))
         self.scan_period_ns = int(rospy.get_param('~scan_period_s', 0.1) * 1e9)
@@ -49,6 +51,11 @@ class Adapter:
             range_sq = values.x * values.x + values.y * values.y + values.z * values.z
             if range_sq < self.min_useful_range ** 2 or range_sq >= (self.max_range - 0.05) ** 2:
                 continue
+            # Deliberately remove vertical constraints while preserving the
+            # stream and original acquisition times. Nominal mount rotation
+            # only; never use simulator truth to construct algorithm inputs.
+            if self.geometry_loss and abs(-0.5 * values.x + math.sqrt(0.75) * values.z) >= 0.20:
+                continue
             point = CustomPoint()
             # Every ray belongs to the scan end time, matching Gazebo's snapshot.
             point.offset_time = self.scan_period_ns
@@ -73,6 +80,10 @@ class Adapter:
     def set_imu_fault(self, request):
         self.drop_imu = request.data
         return SetBoolResponse(success=True, message='Simulated lidar IMU paused' if request.data else 'Lidar IMU restored')
+
+    def set_geometry_fault(self, request):
+        self.geometry_loss = request.data
+        return SetBoolResponse(success=True, message='Vertical lidar constraints removed' if request.data else 'Lidar geometry restored')
 
 
 if __name__ == '__main__':

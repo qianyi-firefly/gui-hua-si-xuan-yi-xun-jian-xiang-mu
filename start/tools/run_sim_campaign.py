@@ -30,7 +30,8 @@ def main():
         raise SystemExit('Core acceptance did not finish within the recorded wait deadline')
     cases=['multi_goal','corridor','three_d','blocked','boundaries','kill_planner','kill_traj',
            'kill_lio','kill_bridge','kill_manager','kill_mavros','mavlink_drop','pose_jump',
-           'timestamp_regression','clock_reset','gui_camera_loss','stress']
+           'timestamp_regression','clock_reset','geometry_loss','gui_camera_loss','stress',
+           'high_lio_loss','gui_land']
     print('Core passed; starting '+str(len(cases))+' extended flight cases',flush=True)
     code=subprocess.call([sys.executable,str(Path(__file__).with_name('run_extended_scenarios.py')),
                           a.extended_directory,'--cases']+cases,cwd=root,env=os.environ)

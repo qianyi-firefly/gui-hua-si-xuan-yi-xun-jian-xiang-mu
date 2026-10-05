@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import os
 import sys
 import threading
 import time
@@ -24,8 +25,10 @@ FAULT_NODES={'kill_planner':'/ego_planner_node','kill_traj':'/traj_server',
              'kill_lio':'/laserMapping','kill_bridge':'/drone_lio_bridge',
              'kill_manager':'/drone_flight_manager','kill_mavros':'/mavros'}
 INPUT_FAULTS=['pose_jump','timestamp_regression','clock_reset']
+GEOMETRY_FAULTS=['geometry_loss']
 COMM_FAULTS=['mavlink_drop']
 GUI_CASES=['gui_camera_loss']
+ADDITIONAL_CASES=['high_lio_loss','gui_land']
 
 
 def px4_mode(custom_mode):
@@ -58,19 +61,26 @@ class NativeMonitor:
             message=self.link.recv_match(type='HEARTBEAT',blocking=True,timeout=.5)
             if message is None or message.get_srcSystem()!=1 or message.get_srcComponent()!=1:
                 continue
-            entry={'wall_monotonic':time.monotonic(),'mode':px4_mode(message.custom_mode),
+            entry={'wall_monotonic':time.monotonic(),'sim_t':rospy.Time.now().to_sec(),'mode':px4_mode(message.custom_mode),
                    'custom_mode':int(message.custom_mode),'base_mode':int(message.base_mode),
                    'armed':bool(message.base_mode & self.mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)}
             self.last=entry
             self.records.append(entry)
 
     def fresh(self):
-        return self.last is not None and time.monotonic()-self.last['wall_monotonic']<2
+        # SITL heartbeats follow simulation time. Rendering can slow or pause
+        # the world; retain a separate wall deadline to detect a frozen link.
+        return (self.last is not None and
+                0<=rospy.Time.now().to_sec()-self.last['sim_t']<2 and
+                time.monotonic()-self.last['wall_monotonic']<10)
 
     def close(self):
         self.alive=False
         self.worker.join(timeout=2)
         self.link.close()
+        directory=os.environ.get('DRONE_EXPERIMENT_DIR')
+        if directory:
+            (Path(directory)/'native_heartbeats.json').write_text(json.dumps(self.records,indent=2)+'\n')
 
     def emergency_land(self):
         self.link.mav.command_long_send(1,1,self.mavutil.mavlink.MAV_CMD_DO_SET_MODE,0,
@@ -82,6 +92,9 @@ class Probe:
         self.data = {}
         self.error_sequence = 0
         self.bridge_logs = []
+        self.observation_loss = None
+        self.phase_changes = []
+        self.hover_prefix = None
         self.subscribers = []
         self.subscribers.append(rospy.Subscriber('/rosout',Log,
             lambda m:self.bridge_logs.append(m.msg) if m.name=='/drone_lio_bridge' else None,queue_size=100))
@@ -101,6 +114,11 @@ class Probe:
     def receive(self,key,message):
         self.data[key]=message
         if key=='error':self.error_sequence+=1
+        if key=='phase':self.phase_changes.append((rospy.Time.now().to_sec(),message.data))
+        if key=='raw_lio' and self.observation_loss is None and np.trace(np.asarray(message.pose.covariance).reshape(6,6)[:3,:3])>1e5:
+            self.observation_loss={'stamp':message.header.stamp.to_sec(),
+                'receipt':rospy.Time.now().to_sec(),
+                'truth':self.position('truth').tolist() if 'truth' in self.data else None}
 
     @property
     def phase(self):
@@ -138,6 +156,7 @@ class Probe:
         start_l = self.position('lio')
         poses = []
         errors = []
+        self.hover_prefix = None
         deadline = time.monotonic() + seconds
         while time.monotonic() < deadline:
             if self.phase != 'HOLD' or self.data['state'].mode != 'OFFBOARD':
@@ -145,6 +164,8 @@ class Probe:
             truth = self.position('truth')
             poses.append(truth)
             errors.append(np.linalg.norm((self.position('lio')-start_l)-(truth-start_t)))
+            self.hover_prefix={'truth_range_xyz_m':np.ptp(np.array(poses),axis=0).tolist(),
+                               'max_lio_displacement_error_m':float(max(errors))}
             time.sleep(.1)
         spread = np.ptp(np.array(poses), axis=0)
         result = {'seconds_wall':seconds, 'truth_range_xyz_m':spread.tolist(),
@@ -188,8 +209,62 @@ class Probe:
             time.sleep(.1)
         raise RuntimeError('Goal did not finish within 90 wall seconds')
 
-    def protected_landing(self, monitor, start, begin, injection, limit=1.5):
-        trace=[];reaction=None;deadline=time.monotonic()+55
+    def blocked_goal(self, origin):
+        start=self.position('truth')
+        reply=self.goal(origin+np.array([3.2,0,0]))
+        if reply['accepted']:
+            # As for navigate(), the service and phase topic are separate
+            # connections. Do not certify the HOLD from before this request.
+            self.wait(lambda:self.phase=='NAVIGATING',3)
+            self.wait(lambda:self.phase in ('HOLD','LANDING','DESCENDING','FAILSAFE'),35)
+        elif reply.get('message') not in ('Goal is in unobserved space', 'Goal is inside an inflated obstacle voxel'):
+            raise RuntimeError('Blocked test rejected for unrelated readiness failure: '+str(reply))
+        if self.position('truth')[0]>=2.30:
+            raise RuntimeError('Blocked goal did not stop safely before wall')
+        if self.phase in ('LANDING','DESCENDING','FAILSAFE'):
+            return self.observability_landing(reply,start)
+        if self.phase!='HOLD':
+            raise RuntimeError('Blocked goal did not stop safely')
+        try:
+            hover=self.hover(20)
+        except RuntimeError:
+            if self.observation_loss is None:
+                raise
+            prefix=self.hover_prefix
+            if prefix is not None and (any(v>=limit for v,limit in zip(prefix['truth_range_xyz_m'],[.20,.20,.15])) or
+                                       prefix['max_lio_displacement_error_m']>=.10):
+                raise RuntimeError('Hover exceeded limits before observability protection: '+str(prefix))
+            return self.observability_landing(reply,start)
+        error=self.data.get('error')
+        if reply['accepted'] and (error is None or not any(reason in error.data for reason in
+                ('intersects an inflated obstacle voxel','enters unobserved space','outside configured flight volume'))):
+            raise RuntimeError('Blocked test stopped for unrelated failure: '+str(error))
+        return {'request':reply,'final_truth':self.position('truth').tolist(),
+                'start_truth':start.tolist(),'hover':hover,
+                'protection_reason':error.data if error is not None else None}
+
+    def observability_landing(self, reply, initial_truth):
+        loss=self.observation_loss
+        if loss is None or loss['truth'] is None:
+            raise RuntimeError('Landing without verified native LIO observability loss')
+        self.wait(lambda:any('position observations are degenerate' in s for s in self.bridge_logs),3)
+        events=[t for t,phase in self.phase_changes if t>=loss['stamp'] and phase in ('LANDING','DESCENDING','FAILSAFE')]
+        if not events:raise RuntimeError('No protective landing transition after observability loss')
+        monitor=NativeMonitor()
+        try:
+            self.wait(lambda:monitor.fresh(),5)
+            landing=self.protected_landing(monitor,np.array(loss['truth']),loss['stamp'],
+                {'case':'blocked_observability_loss','native_covariance_rejected':True},
+                initial_reaction=events[0]-loss['stamp'])
+            if self.data['lio_valid'].data:raise RuntimeError('Degenerate bridge resumed before restart')
+            return {'request':reply,'start_truth':initial_truth.tolist(),'observability_loss':loss,
+                    'observability_landing':landing,'hover_before_loss':self.hover_prefix,
+                    'bridge_fault_logs':list(self.bridge_logs),'bridge_remained_invalid_after_landing':True}
+        finally:
+            monitor.close()
+
+    def protected_landing(self, monitor, start, begin, injection, limit=1.5, initial_reaction=None):
+        trace=[];reaction=initial_reaction;deadline=time.monotonic()+55
         while time.monotonic()<deadline:
             if not monitor.fresh():
                 raise RuntimeError('Independent PX4 heartbeat missing')
@@ -210,6 +285,27 @@ class Probe:
         return {'passed':True,'injection':injection,'reaction_sim_s':reaction,
                 'max_rise_m':rise,'max_horizontal_drift_m':drift,'trace':trace,
                 'native_heartbeats':monitor.records}
+
+    def geometry_fault(self):
+        monitor=NativeMonitor()
+        try:
+            self.wait(lambda:monitor.fresh() and monitor.last['armed'] and monitor.last['mode']=='OFFBOARD',8)
+            self.wait(lambda:'lio_valid' in self.data and self.data['lio_valid'].data,5)
+            start=self.position('truth');begin=rospy.Time.now().to_sec()
+            reply=rospy.ServiceProxy('/drone/sim/faults/lidar_geometry',SetBool)(True)
+            if not reply.success:raise RuntimeError('Geometry fault injection failed')
+            self.wait(lambda:self.observation_loss is not None and not self.data['lio_valid'].data,3)
+            self.wait(lambda:any('position observations are degenerate' in s for s in self.bridge_logs),2)
+            result=self.protected_landing(monitor,start,begin,
+                {'case':'geometry_loss','fault_start_sim_s':begin,'streams_preserved':True})
+            result['observability_loss']=self.observation_loss
+            result['bridge_fault_logs']=list(self.bridge_logs)
+            result['bridge_remained_invalid_after_landing']=not self.data['lio_valid'].data
+            if not result['bridge_remained_invalid_after_landing']:
+                raise RuntimeError('Degenerate bridge automatically resumed')
+            return result
+        finally:
+            monitor.close()
 
     def input_fault(self, case):
         monitor=NativeMonitor()
@@ -287,6 +383,27 @@ class Probe:
         return {'passed':True,'stopped_node':'/sim_camera_processor','hover':self.hover(20),
                 'limits':'Processed camera stream loss; image sensor hardware dropout is a separate test.'}
 
+    def gui_landing(self, output):
+        import subprocess
+        monitor=NativeMonitor()
+        try:
+            self.wait(lambda:monitor.fresh() and monitor.last['armed'] and monitor.last['mode']=='OFFBOARD',8)
+            start=self.position('truth')
+            snapshot=Path(output).with_name('gui_land_accessibility.json')
+            subprocess.run(['gnome-screenshot','-f',str(Path(output).with_name('gui_before_land.png'))],check=True,timeout=10)
+            begin=rospy.Time.now().to_sec()
+            # Exercise the actual Qt accessible action; no direct ROS landing service.
+            subprocess.run([sys.executable,str(Path(__file__).with_name('gui_snapshot.py')),
+                            str(snapshot),'--click-land'],check=True,timeout=15)
+            evidence=json.loads(snapshot.read_text())
+            if not evidence.get('landing_action',{}).get('activated'):
+                raise RuntimeError('Actual GUI landing action was not activated')
+            result=self.protected_landing(monitor,start,begin,'actual_Qt_landing_button',limit=4.0)
+            result['gui_evidence']=str(snapshot)
+            return result
+        finally:
+            monitor.close()
+
     def node_fault(self, case):
         import rosnode
         monitor=NativeMonitor()
@@ -355,7 +472,7 @@ class Probe:
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('case',choices=['multi_goal','corridor','three_d','blocked','boundaries','stress']+list(FAULT_NODES)+INPUT_FAULTS+COMM_FAULTS+GUI_CASES)
+    parser.add_argument('case',choices=['multi_goal','corridor','three_d','blocked','boundaries','stress']+list(FAULT_NODES)+INPUT_FAULTS+GEOMETRY_FAULTS+COMM_FAULTS+GUI_CASES+ADDITIONAL_CASES)
     parser.add_argument('output')
     args=parser.parse_args()
     rospy.init_node('extended_flight_probe',anonymous=True)
@@ -363,11 +480,23 @@ def main():
     try:
         p=Probe()
         origin=p.position()
-        if args.case in GUI_CASES:
+        if args.case=='high_lio_loss':
+            target=origin.copy();target[2]=2.45
+            step=p.navigate(target);result['steps'].append(step)
+            step['hover']=p.hover(20)
+            result['steps'].append(p.node_fault('kill_lio'))
+            offsets=[]
+        elif args.case=='gui_land':
+            result['steps'].append(p.gui_landing(args.output))
+            offsets=[]
+        elif args.case in GUI_CASES:
             result['steps'].append(p.camera_fault())
             offsets=[]
         elif args.case in COMM_FAULTS:
             result['steps'].append(p.communication_fault())
+            offsets=[]
+        elif args.case in GEOMETRY_FAULTS:
+            result['steps'].append(p.geometry_fault())
             offsets=[]
         elif args.case in INPUT_FAULTS:
             result['steps'].append(p.input_fault(args.case))
@@ -399,16 +528,7 @@ def main():
             result['steps'].append({'rejected':rejected,'hover':p.hover(20)})
             offsets=[]
         else:
-            start=p.position('truth')
-            reply=p.goal(origin+np.array([3.2,0,0]))
-            if reply['accepted']:
-                p.wait(lambda:p.phase=='HOLD',35)
-            # Known impassable wall spans world Y and the flight ceiling.
-            # Abort/hold must leave the vehicle on the original side.
-            if p.position('truth')[0]>=2.30 or p.phase!='HOLD':
-                raise RuntimeError('Blocked goal did not stop safely before wall')
-            result['steps'].append({'request':reply,'final_truth':p.position('truth').tolist(),
-                                   'start_truth':start.tolist(),'hover':p.hover(20)})
+            result['steps'].append(p.blocked_goal(origin))
             offsets=[]
         for offset in offsets:
             step=p.navigate(origin+np.array(offset))

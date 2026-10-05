@@ -1,5 +1,6 @@
 #include "bspline_opt/bspline_optimizer.h"
 #include "bspline_opt/gradient_descent_optimizer.h"
+#include "bspline_opt/trajectory_collision.h"
 // using namespace std;
 
 namespace ego_planner
@@ -11,6 +12,7 @@ namespace ego_planner
     nh.param("optimization/lambda_collision", lambda2_, -1.0);
     nh.param("optimization/lambda_feasibility", lambda3_, -1.0);
     nh.param("optimization/lambda_fitness", lambda4_, -1.0);
+    nh.param("optimization/global_reference_weight", global_reference_weight_, 8.0);
 
     nh.param("optimization/dist0", dist0_, -1.0);
     nh.param("optimization/max_vel", max_vel_, -1.0);
@@ -61,7 +63,7 @@ namespace ego_planner
     int same_occ_state_times = ENOUGH_INTERVAL + 1;
     bool occ, last_occ = false;
     bool flag_got_start = false, flag_got_end = false, flag_got_end_maybe = false;
-    int i_end = (int)init_points.cols() - order_ - ((int)init_points.cols() - 2 * order_) / 3; // only check closed 2/3 points.
+    int i_end = (int)init_points.cols() - order_; // Complete local trajectory.
     for (int i = order_; i <= i_end; ++i)
     {
       for (double a = 1.0; a >= 0.0; a -= step_size)
@@ -674,7 +676,7 @@ namespace ego_planner
     int in_id, out_id;
     vector<std::pair<int, int>> segment_ids;
     bool flag_new_obs_valid = false;
-    int i_end = end_idx - (end_idx - order_) / 3;
+    int i_end = end_idx;
     for (int i = order_ - 1; i <= i_end; ++i)
     {
 
@@ -726,7 +728,7 @@ namespace ego_planner
         }
         if (j >= cps_.size) // fail to get the obs free point
         {
-          ROS_WARN("WARN! terminal point of the current trajectory is in obstacle, skip this planning.");
+          ROS_WARN_THROTTLE(1.0, "Internal trajectory tail intersects obstacle; retry local planning.");
 
           force_stop_type_ = STOP_FOR_ERROR;
           
@@ -943,26 +945,12 @@ namespace ego_planner
         UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
         double tm, tmp;
         traj.getTimeSpan(tm, tmp);
-        double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution());
-        for (double t = tm; t < tmp * 2 / 3; t += t_step) // Only check the closest 2/3 partition of the whole trajectory.
+        double collision_time=0.;
+        flag_occ=!continuousTrajectoryFree(traj,grid_map_,collision_time,0.05);
+        if (flag_occ && collision_time <= bspline_interval_)
         {
-          flag_occ = grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t));
-          if (flag_occ)
-          {
-            //cout << "hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
-            if (t <= bspline_interval_) // First 3 control points in obstacles!
-            {
-              cout << cps_.points.col(1).transpose() << "\n"
-                   << cps_.points.col(2).transpose() << "\n"
-                   << cps_.points.col(3).transpose() << "\n"
-                   << cps_.points.col(4).transpose() << endl;
-              ROS_WARN("First 3 control points in obstacles! return false, t=%f", t);
-              return false;
-            }
-
-            break;
-          }
+          ROS_WARN("Continuous curve starts in occupied safety margin; retry initialization");
+          return false;
         }
 
         if (!flag_occ)
@@ -972,6 +960,7 @@ namespace ego_planner
         }
         else // restart
         {
+          ROS_WARN_THROTTLE(1.,"Continuous local curve violates safety margin at t=%.3f; global_reference=%d",collision_time,!global_reference_pts_.empty());
           restart_nums++;
           initControlPoints(cps_.points, false);
           new_lambda2_ *= 2;
@@ -1036,23 +1025,8 @@ namespace ego_planner
       UniformBspline traj = UniformBspline(cps_.points, 3, bspline_interval_);
       double tm, tmp;
       traj.getTimeSpan(tm, tmp);
-      double t_step = (tmp - tm) / ((traj.evaluateDeBoorT(tmp) - traj.evaluateDeBoorT(tm)).norm() / grid_map_->getResolution()); // Step size is defined as the maximum size that can passes throgth every gird.
-      for (double t = tm; t < tmp * 2 / 3; t += t_step)
-      {
-        if (grid_map_->getInflateOccupancy(traj.evaluateDeBoorT(t)))
-        {
-          // cout << "Refined traj hit_obs, t=" << t << " P=" << traj.evaluateDeBoorT(t).transpose() << endl;
-
-          Eigen::MatrixXd ref_pts(ref_pts_.size(), 3);
-          for (size_t i = 0; i < ref_pts_.size(); i++)
-          {
-            ref_pts.row(i) = ref_pts_[i].transpose();
-          }
-
-          flag_safe = false;
-          break;
-        }
-      }
+      double collision_time=0.;
+      flag_safe=continuousTrajectoryFree(traj,grid_map_,collision_time,0.05);
 
       if (!flag_safe)
         lambda4_ *= 2;
@@ -1087,6 +1061,17 @@ namespace ego_planner
     //printf("origin %f %f %f %f\n", f_smoothness, f_distance, f_feasibility, f_combine);
 
     Eigen::MatrixXd grad_3D = lambda1_ * g_smoothness + new_lambda2_ * g_distance + lambda3_ * g_feasibility;
+    // Preserve the actual authoritative global curve during rebound
+    // optimization, rather than using it only as a disposable initial guess.
+    // This is a soft constraint: collision/feasibility guards still decide.
+    if(global_reference_pts_.size()==size_t(cps_.size-2)) {
+      for(int i=1;i+1<cps_.size;++i) {
+        const Eigen::Vector3d difference=(cps_.points.col(i-1)+4*cps_.points.col(i)+cps_.points.col(i+1))/6.-global_reference_pts_[i-1];
+        f_combine+=global_reference_weight_*difference.squaredNorm();
+        const Eigen::Vector3d gradient=2*global_reference_weight_*difference;
+        grad_3D.col(i-1)+=gradient/6.;grad_3D.col(i)+=gradient*4/6.;grad_3D.col(i+1)+=gradient/6.;
+      }
+    }
     memcpy(grad, grad_3D.data() + 3 * order_, n * sizeof(grad[0]));
   }
 

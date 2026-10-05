@@ -31,6 +31,9 @@
          delayed.  Keep a bounded margin for a short EGO CPU spike. -->
     <param name="max_pose_age_s" value="0.70"/>
     <param name="max_traj_age_s" value="0.50"/>
+    <param name="require_observed_free" value="true"/>
+    <param name="known_execution_horizon_s" value="3.0"/>
   </node>
+  <node pkg="drone_stack" type="safe_global_path.py" name="drone_safe_global_path" output="screen"/>
   <node if="$(arg gui)" pkg="drone_stack" type="drone_operator_gui" name="drone_operator_gui" output="screen"/>
 </launch>

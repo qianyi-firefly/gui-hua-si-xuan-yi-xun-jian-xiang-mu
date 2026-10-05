@@ -1,4 +1,6 @@
 #include <plan_manage/ego_replan_fsm.h>
+#include <cmath>
+#include <limits>
 
 namespace ego_planner
 {
@@ -31,6 +33,13 @@ namespace ego_planner
     planner_manager_.reset(new EGOPlannerManager);
     planner_manager_->initPlanModules(nh, visualization_);
 
+    start_service_ = nh.advertiseService("/planning/start", &EGOReplanFSM::startPlanningCallback, this);
+    nh.param("fsm/use_global_route",use_global_route_,false);
+    global_route_sub_=nh.subscribe("/drone/global_route",1,&EGOReplanFSM::globalRouteCallback,this);
+    local_target_pub_=nh.advertise<geometry_msgs::PoseStamped>("/planning/local_target",1);
+    clearLocalPlan();
+    speed_service_ = nh.advertiseService("/planning/apply_speed", &EGOReplanFSM::applySpeedCallback, this);
+
     /* callback */
     exec_timer_ = nh.createTimer(ros::Duration(0.01), &EGOReplanFSM::execFSMCallback, this);
     safety_timer_ = nh.createTimer(ros::Duration(0.05), &EGOReplanFSM::checkCollisionCallback, this);
@@ -41,7 +50,7 @@ namespace ego_planner
     bspline_pub_ = nh.advertise<ego_planner::Bspline>("/planning/bspline", 10);
     data_disp_pub_ = nh.advertise<ego_planner::DataDisp>("/planning/data_display", 100);
 
-    if (target_type_ == TARGET_TYPE::MANUAL_TARGET)
+    if (target_type_ == TARGET_TYPE::MANUAL_TARGET && !use_global_route_)
       waypoint_sub_ = nh.subscribe("/waypoint_generator/waypoints", 1, &EGOReplanFSM::waypointCallback, this);
     else if (target_type_ == TARGET_TYPE::PRESET_TARGET)
     {
@@ -50,8 +59,83 @@ namespace ego_planner
         ros::spinOnce();
       planGlobalTrajbyGivenWps();
     }
-    else
+    else if (!use_global_route_)
       cout << "Wrong target_type_ value! target_type_=" << target_type_ << endl;
+  }
+
+  void EGOReplanFSM::clearLocalPlan()
+  {
+    planning_enabled_=false; trigger_=false; have_target_=false; have_new_target_=false;
+    last_failed_plan_=ros::Time(0);
+    auto &local=planner_manager_->local_data_;
+    const int id=local.traj_id_; // Preserve monotonically increasing IDs.
+    local=LocalTrajData(); local.traj_id_=id; local.duration_=0.;
+    local.global_time_offset=0.; local.start_time_=ros::Time(0); local.start_pos_.setZero();
+    // Global route belongs to the prepared target. Clear its old local splice
+    // and progress; the next start service rebuilds the global polynomial.
+    auto &global=planner_manager_->global_data_;
+    global.local_traj_.clear(); global.last_progress_time_=0.;
+    global.local_start_time_=-1.; global.local_end_time_=-1.;
+    global.time_increase_=0.; global.last_time_inc_=0.;
+    changeFSMExecState(INIT, "RESET");
+  }
+
+  bool EGOReplanFSM::startPlanningCallback(ego_planner::StartPlanning::Request &req,
+                                         ego_planner::StartPlanning::Response &reply)
+  {
+    reply.generation=req.generation;
+    reply.next_trajectory_id=planner_manager_->local_data_.traj_id_+1;
+    if (req.generation<session_generation_) {
+      reply.success=false; reply.message="Obsolete planning session"; return true;
+    }
+    session_generation_=req.generation;
+    prepared_start_=false;
+    clearLocalPlan();
+    route_points_.clear(); route_stamp_=ros::Time(0);
+    if (!req.enabled) { reply.success=true; reply.message="Previous local curve cleared"; return true; }
+    const auto &p=req.goal.pose.position;
+    const double age=(ros::Time::now()-odom_stamp_).toSec();
+    if (!have_odom_ || odom_stamp_.isZero() || age<-.02 || age>.7 ||
+        req.goal.header.frame_id!="odom" || !std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+        fabs(p.x)>8 || fabs(p.y)>8 || p.z<.5 || p.z>2.5 ||
+        !std::isfinite(req.speed_mps) || req.speed_mps<.1 || req.speed_mps>1.) {
+      reply.success=false; reply.message="Invalid goal, speed or stale start odometry"; return true;
+    }
+    planner_manager_->setNavigationSpeed(req.speed_mps);
+    ros::param::set("/ego_planner_node/manager/max_vel",req.speed_mps);
+    ros::param::set("/ego_planner_node/optimization/max_vel",req.speed_mps);
+    end_pt_=Eigen::Vector3d(p.x,p.y,p.z); end_vel_.setZero(); init_pt_=odom_pos_;
+    route_sequence_=req.goal.header.stamp.toNSec();
+    if (!installRoute(req.route)) {
+      reply.success=false; reply.message="Fresh complete unified route required"; return true;
+    }
+    prepared_start_=true;
+    // The manager publishes enabled=true only AFTER this ACK. Until then both
+    // timers stay disabled, so a collision callback cannot restore an old curve.
+    reply.success=true; reply.message="New target prepared from current odometry";
+    ROS_INFO("Prepared planning session %lu, next curve >= %d, start [%.3f %.3f %.3f]",
+             static_cast<unsigned long>(req.generation),reply.next_trajectory_id,
+             odom_pos_.x(),odom_pos_.y(),odom_pos_.z());
+    return true;
+  }
+
+  bool EGOReplanFSM::applySpeedCallback(std_srvs::Trigger::Request&, std_srvs::Trigger::Response& reply)
+  {
+    double speed = 0.5;
+    ros::param::get("/drone/navigation_speed_request", speed);
+    if (!std::isfinite(speed) || speed < 0.1 || speed > 1.0) {
+      reply.success = false; reply.message = "Invalid navigation speed"; return true;
+    }
+    // This service runs on the planner's single callback thread, before the
+    // manager sends the new goal; update both cached planning limits together.
+    prepared_start_=false;
+    clearLocalPlan();
+    planner_manager_->setNavigationSpeed(speed);
+    ros::param::set("/ego_planner_node/manager/max_vel", speed);
+    ros::param::set("/ego_planner_node/optimization/max_vel", speed);
+    reply.success = true; reply.message = "Planner speed applied: " + std::to_string(speed);
+    ROS_INFO("Navigation speed applied: %.2f m/s", speed);
+    return true;
   }
 
   void EGOReplanFSM::planGlobalTrajbyGivenWps()
@@ -167,18 +251,20 @@ namespace ego_planner
 
   void EGOReplanFSM::planningEnabledCallback(const std_msgs::BoolConstPtr &msg)
   {
-    planning_enabled_ = msg->data;
-    if (!planning_enabled_)
-    {
-      trigger_ = false;
-      have_target_ = false;
-      have_new_target_ = false;
-      changeFSMExecState(INIT, "OPERATOR");
-    }
+    if (!msg->data) {
+      // An earlier STOP topic can arrive after the prepare service on another
+      // connection. It clears active state but preserves the prepared target.
+      clearLocalPlan();
+    } else if (prepared_start_) {
+      prepared_start_=false;
+      planning_enabled_=true; trigger_=true; have_target_=true; have_new_target_=true;
+      changeFSMExecState(GEN_NEW_TRAJ,"ACK_START");
+    } // A bare true without an acknowledged target cannot resume any curve.
   }
 
   void EGOReplanFSM::odometryCallback(const nav_msgs::OdometryConstPtr &msg)
   {
+    odom_stamp_=msg->header.stamp;
     odom_pos_(0) = msg->pose.pose.position.x;
     odom_pos_(1) = msg->pose.pose.position.y;
     odom_pos_(2) = msg->pose.pose.position.z;
@@ -243,6 +329,9 @@ namespace ego_planner
     data_disp_.fsm_state = static_cast<int>(exec_state_);
     data_disp_.header.stamp = ros::Time::now();
     data_disp_pub_.publish(data_disp_);
+    if ((exec_state_ == GEN_NEW_TRAJ || exec_state_ == REPLAN_TRAJ) &&
+        !last_failed_plan_.isZero() && (ros::Time::now()-last_failed_plan_).toSec() < 0.2)
+      return; // Publish heartbeat above even while backing off failed planning.
     switch (exec_state_)
     {
     case INIT:
@@ -274,6 +363,14 @@ namespace ego_planner
     {
       start_pt_ = odom_pos_;
       start_vel_ = odom_vel_;
+      // New plans start while the manager holds/brakes the aircraft. Small
+      // residual EKF velocity must not bend the route backwards at its origin.
+      // This is a planning boundary condition, not a change to odometry/fusion.
+      if (start_vel_.norm() <= 0.1)
+      {
+        start_vel_.setZero();
+        ROS_INFO_THROTTLE(1.0, "Stationary local-plan start: zero boundary velocity");
+      }
       start_acc_.setZero();
 
       // Eigen::Vector3d rot_x = odom_orient_.toRotationMatrix().block(0, 0, 3, 1);
@@ -295,6 +392,7 @@ namespace ego_planner
       }
       else
       {
+        last_failed_plan_ = ros::Time::now();
         changeFSMExecState(GEN_NEW_TRAJ, "FSM");
       }
       break;
@@ -309,6 +407,7 @@ namespace ego_planner
       }
       else
       {
+        last_failed_plan_ = ros::Time::now();
         changeFSMExecState(REPLAN_TRAJ, "FSM");
       }
 
@@ -328,6 +427,11 @@ namespace ego_planner
       /* && (end_pt_ - pos).norm() < 0.5 */
       if (t_cur > info->duration_ - 1e-2)
       {
+        if (use_global_route_ && (end_pt_-odom_pos_).norm()>.2) {
+          have_new_target_=true;
+          changeFSMExecState(GEN_NEW_TRAJ,"ROUTE_CONTINUE");
+          return;
+        }
         have_target_ = false;
 
         changeFSMExecState(WAIT_TARGET, "FSM");
@@ -374,8 +478,11 @@ namespace ego_planner
   {
 
     LocalTrajData *info = &planner_manager_->local_data_;
+    if (!planning_enabled_ || !have_target_ || info->start_time_.isZero() || info->duration_<=0 ||
+        (exec_state_!=EXEC_TRAJ && exec_state_!=REPLAN_TRAJ)) return false;
     ros::Time time_now = ros::Time::now();
     double t_cur = (time_now - info->start_time_).toSec();
+    if (t_cur<0 || t_cur>info->duration_) return false;
 
     //cout << "info->velocity_traj_=" << info->velocity_traj_.get_control_points() << endl;
 
@@ -409,7 +516,8 @@ namespace ego_planner
     LocalTrajData *info = &planner_manager_->local_data_;
     auto map = planner_manager_->grid_map_;
 
-    if (exec_state_ == WAIT_TARGET || info->start_time_.toSec() < 1e-5)
+    if (!have_target_ || (exec_state_ != EXEC_TRAJ && exec_state_ != REPLAN_TRAJ) ||
+        info->start_time_.isZero() || info->duration_<=0)
       return;
 
     /* ---------- check trajectory ---------- */
@@ -450,7 +558,7 @@ namespace ego_planner
   bool EGOReplanFSM::callReboundReplan(bool flag_use_poly_init, bool flag_randomPolyTraj)
   {
 
-    getLocalTarget();
+    if (!getLocalTarget()) return false;
 
     bool plan_success =
         planner_manager_->reboundReplan(start_pt_, start_vel_, start_acc_, local_target_pt_, local_target_vel_, (have_new_target_ || flag_use_poly_init), flag_randomPolyTraj);
@@ -531,8 +639,9 @@ namespace ego_planner
     return true;
   }
 
-  void EGOReplanFSM::getLocalTarget()
+  bool EGOReplanFSM::getLocalTarget()
   {
+    if (use_global_route_) return getRouteTarget();
     double t;
 
     double t_step = planning_horizen_ / 20 / planner_manager_->pp_.max_vel_;
@@ -545,12 +654,8 @@ namespace ego_planner
       if (t < planner_manager_->global_data_.last_progress_time_ + 1e-5 && dist > planning_horizen_)
       {
         // todo
-        ROS_ERROR("last_progress_time_ ERROR !!!!!!!!!");
-        ROS_ERROR("last_progress_time_ ERROR !!!!!!!!!");
-        ROS_ERROR("last_progress_time_ ERROR !!!!!!!!!");
-        ROS_ERROR("last_progress_time_ ERROR !!!!!!!!!");
-        ROS_ERROR("last_progress_time_ ERROR !!!!!!!!!");
-        return;
+        ROS_WARN_THROTTLE(1.0, "Global progress outside local horizon; requesting a fresh task curve");
+        return false;
       }
       if (dist < dist_min)
       {
@@ -564,11 +669,49 @@ namespace ego_planner
         break;
       }
     }
-    if (t > planner_manager_->global_data_.global_duration_) // Last global point
+    if (t >= planner_manager_->global_data_.global_duration_) // Last global point
     {
       local_target_pt_ = end_pt_;
     }
 
+    // A horizon point on the global polynomial may lie inside an obstacle,
+    // even when the operator's final goal is free. Select a nearby free local
+    // endpoint; the optimizer and continuous-curve guard still check the route.
+    auto map = planner_manager_->grid_map_;
+    if (!map->isInMap(local_target_pt_) || map->getInflateOccupancy(local_target_pt_) != 0)
+    {
+      if ((local_target_pt_-end_pt_).norm() < 1e-3)
+      {
+        ROS_WARN_THROTTLE(1.0, "Final navigation goal is occupied or outside map");
+        return false;
+      }
+      const Eigen::Vector3d desired = local_target_pt_;
+      double best = std::numeric_limits<double>::infinity();
+      Eigen::Vector3d candidate = desired;
+      for (double radius : {0.2, 0.4, 0.8, 1.2})
+        for (int direction=0; direction<16; ++direction)
+        {
+          const double angle=direction*2.0*M_PI/16.0;
+          Eigen::Vector3d p=desired+Eigen::Vector3d(radius*cos(angle),radius*sin(angle),0);
+          if (fabs(p.x())>8 || fabs(p.y())>8 || p.z()<0.5 || p.z()>2.5 ||
+              !map->isInMap(p) || map->getInflateOccupancy(p)!=0 ||
+              (p-start_pt_).norm()>planning_horizen_+0.2 ||
+              (p-end_pt_).norm() >= (start_pt_-end_pt_).norm()-0.1) continue;
+          const double cost=(p-desired).norm()+0.35*(p-end_pt_).norm();
+          if (cost<best) { best=cost; candidate=p; }
+        }
+      if (!std::isfinite(best))
+      {
+        ROS_WARN_THROTTLE(1.0, "No free local horizon endpoint; retaining final goal for later replan");
+        return false;
+      }
+      local_target_pt_=candidate;
+      local_target_vel_=Eigen::Vector3d::Zero();
+      ROS_INFO_THROTTLE(1.0, "Occupied local horizon endpoint adjusted to [%.2f %.2f %.2f]",
+                        candidate.x(),candidate.y(),candidate.z());
+      return true;
+    }
+    t=std::min(t,planner_manager_->global_data_.global_duration_);
     if ((end_pt_ - local_target_pt_).norm() < (planner_manager_->pp_.max_vel_ * planner_manager_->pp_.max_vel_) / (2 * planner_manager_->pp_.max_acc_))
     {
       // local_target_vel_ = (end_pt_ - init_pt_).normalized() * planner_manager_->pp_.max_vel_ * (( end_pt_ - local_target_pt_ ).norm() / ((planner_manager_->pp_.max_vel_*planner_manager_->pp_.max_vel_)/(2*planner_manager_->pp_.max_acc_)));
@@ -578,8 +721,87 @@ namespace ego_planner
     else
     {
       local_target_vel_ = planner_manager_->global_data_.getVelocity(t);
+      if (local_target_vel_.norm()>planner_manager_->pp_.max_vel_)
+        local_target_vel_=local_target_vel_.normalized()*planner_manager_->pp_.max_vel_;
       // cout << "AA" << endl;
     }
+    return true;
+  }
+
+  bool EGOReplanFSM::installRoute(const nav_msgs::Path &msg)
+  {
+    const double age=(ros::Time::now()-msg.header.stamp).toSec();
+    if (msg.header.frame_id!="odom" ||
+        msg.poses.size()<2 || msg.poses.size()>2048 || age<-.02 || age>2.) return false;
+    vector<Eigen::Vector3d> points;
+    for (const auto &pose:msg.poses) {
+      const auto &p=pose.pose.position;
+      Eigen::Vector3d v(p.x,p.y,p.z);
+      if (!v.allFinite() || fabs(v.x())>8 || fabs(v.y())>8 || v.z()<.5 || v.z()>2.5) return false;
+      if (points.empty() || (points.back()-v).norm()>1e-5) points.push_back(v);
+    }
+    if (points.size()<2 || (points.back()-end_pt_).norm()>.02) return false;
+    route_points_=std::move(points);route_stamp_=msg.header.stamp;
+    return true;
+  }
+
+  void EGOReplanFSM::globalRouteCallback(const ego_planner::GlobalRouteConstPtr &msg)
+  {
+    if (!use_global_route_ || (!planning_enabled_ && !prepared_start_) || msg->task_id!=route_sequence_) return;
+    // Empty/partial routes mean the front end is searching. Suspend target
+    // generation until a complete replacement arrives; safety still checks
+    // the currently active local curve against the latest occupied map.
+    if (msg->path.poses.size()<2) {
+      route_points_.clear();route_stamp_=ros::Time(0);return;
+    }
+    if (!installRoute(msg->path)) route_points_.clear();
+  }
+
+  bool EGOReplanFSM::getRouteTarget()
+  {
+    const double age=(ros::Time::now()-route_stamp_).toSec();
+    if (route_points_.size()<2 || age<-.02 || age>2.) {
+      ROS_WARN_THROTTLE(1.,"Waiting for fresh complete unified global route");return false;
+    }
+    // Project the planning start onto the current polyline, then stop the
+    // local target at its next bend. A direct horizon chord must not cut
+    // across a corner that the global A* deliberately routed around.
+    size_t segment=0;double best=1e9;Eigen::Vector3d projection;
+    for(size_t i=0;i+1<route_points_.size();++i) {
+      Eigen::Vector3d d=route_points_[i+1]-route_points_[i];
+      double u=std::max(0.,std::min(1.,(start_pt_-route_points_[i]).dot(d)/d.squaredNorm()));
+      Eigen::Vector3d q=route_points_[i]+u*d;double gap=(q-start_pt_).norm();
+      if(gap<=best+1e-8) {best=gap;segment=i;projection=q;}
+    }
+    if(best>.75) {ROS_WARN_THROTTLE(1.,"Planning start too far from unified route");return false;}
+    double remaining=planning_horizen_;Eigen::Vector3d from=projection;
+    bool stop=false;Eigen::Vector3d end_tangent=Eigen::Vector3d::Zero();
+    vector<Eigen::Vector3d> seed;seed.push_back(start_pt_);
+    if((projection-start_pt_).norm()>.02) seed.push_back(projection);
+    local_target_pt_=projection;
+    for(size_t i=segment+1;i<route_points_.size();++i) {
+      Eigen::Vector3d d=route_points_[i]-from;double length=d.norm();
+      if(length<1e-6) {from=route_points_[i];continue;}
+      end_tangent=d/length;
+      if(length>=remaining) {
+        local_target_pt_=from+end_tangent*remaining;seed.push_back(local_target_pt_);break;
+      }
+      remaining-=length;local_target_pt_=route_points_[i];seed.push_back(local_target_pt_);
+      if(i+1==route_points_.size()) {stop=true;break;}
+      // Dense smooth samples are a continuous reference: do not stop at each
+      // tiny chord or replace the curve by a start-to-horizon straight seed.
+      from=route_points_[i];
+    }
+    auto map=planner_manager_->grid_map_;
+    if(!map->isInMap(local_target_pt_) || map->getInflateOccupancy(local_target_pt_)!=0) return false;
+    if((local_target_pt_-start_pt_).norm()<.1 || seed.size()<2) return false;
+    planner_manager_->route_seed_=std::move(seed);
+    local_target_vel_=stop?Eigen::Vector3d::Zero().eval():(end_tangent*planner_manager_->pp_.max_vel_).eval();
+    geometry_msgs::PoseStamped target;target.header.frame_id="odom";target.header.stamp=ros::Time::now();
+    target.pose.position.x=local_target_pt_.x();target.pose.position.y=local_target_pt_.y();target.pose.position.z=local_target_pt_.z();target.pose.orientation.w=1;
+    local_target_pub_.publish(target);
+    ROS_INFO_THROTTLE(1.,"Unified route local target [%.3f %.3f %.3f], endpoint_stop=%d",local_target_pt_.x(),local_target_pt_.y(),local_target_pt_.z(),stop);
+    return true;
   }
 
 } // namespace ego_planner

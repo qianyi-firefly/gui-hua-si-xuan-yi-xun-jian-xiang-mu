@@ -3,6 +3,7 @@
 #include "ego_planner/Bspline.h"
 #include "quadrotor_msgs/PositionCommand.h"
 #include "std_msgs/Empty.h"
+#include "std_msgs/Bool.h"
 #include "visualization_msgs/Marker.h"
 #include <ros/ros.h>
 
@@ -15,6 +16,10 @@ double vel_gain[3] = {0, 0, 0};
 using ego_planner::UniformBspline;
 
 bool receive_traj_ = false;
+bool planning_enabled_ = false;
+ego_planner::BsplineConstPtr pending_traj_;
+ros::Time last_disabled_;
+void bsplineCallback(ego_planner::BsplineConstPtr msg);
 vector<UniformBspline> traj_;
 double traj_duration_;
 ros::Time start_time_;
@@ -24,8 +29,27 @@ int traj_id_;
 double last_yaw_, last_yaw_dot_;
 double time_forward_;
 
+void planningEnabledCallback(const std_msgs::BoolConstPtr &msg)
+{
+  planning_enabled_ = msg->data;
+  if (!planning_enabled_) {
+    receive_traj_ = false;
+    traj_.clear(); pending_traj_.reset(); last_disabled_=ros::Time::now();
+  } else if (pending_traj_) {
+    auto pending=pending_traj_; pending_traj_.reset();
+    const double age=(ros::Time::now()-pending->start_time).toSec();
+    if (pending->start_time>=last_disabled_ && age>=-.5 && age<=.5)
+      bsplineCallback(pending);
+  }
+}
+
 void bsplineCallback(ego_planner::BsplineConstPtr msg)
 {
+  if (!planning_enabled_) {
+    const double age=(ros::Time::now()-msg->start_time).toSec();
+    if (msg->start_time>=last_disabled_ && age>=-.5 && age<=.5) pending_traj_=msg;
+    return;
+  }
   // parse pos traj
 
   Eigen::MatrixXd pos_pts(3, msg->pos_pts.size());
@@ -163,7 +187,7 @@ std::pair<double, double> calculate_yaw(double t_cur, Eigen::Vector3d &pos, ros:
 void cmdCallback(const ros::TimerEvent &e)
 {
   /* no publishing before receive traj_ */
-  if (!receive_traj_)
+  if (!planning_enabled_ || !receive_traj_)
     return;
 
   ros::Time time_now = ros::Time::now();
@@ -235,6 +259,7 @@ int main(int argc, char **argv)
   ros::NodeHandle node;
   ros::NodeHandle nh("~");
 
+  ros::Subscriber enabled_sub = node.subscribe("/drone/planning_enabled", 1, planningEnabledCallback);
   ros::Subscriber bspline_sub = node.subscribe("planning/bspline", 10, bsplineCallback);
 
   pos_cmd_pub = node.advertise<quadrotor_msgs::PositionCommand>("/position_cmd", 50);

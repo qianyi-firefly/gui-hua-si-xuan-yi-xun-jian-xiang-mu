@@ -54,6 +54,7 @@ namespace ego_planner
     /* main API */
     void setEnvironment(const GridMap::Ptr &env);
     void setParam(ros::NodeHandle &nh);
+    void setMaxVelocity(double speed) { max_vel_ = speed; }
     Eigen::MatrixXd BsplineOptimizeTraj(const Eigen::MatrixXd &points, const double &ts,
                                         const int &cost_function, int max_num_id, int max_time_id);
 
@@ -76,6 +77,8 @@ namespace ego_planner
 
     AStar::Ptr a_star_;
     std::vector<Eigen::Vector3d> ref_pts_;
+    std::vector<Eigen::Vector3d> global_reference_pts_;
+    double global_reference_weight_{8.0};
 
     std::vector<std::vector<Eigen::Vector3d>> initControlPoints(Eigen::MatrixXd &init_points, bool flag_first_init = true);
     bool BsplineOptimizeTrajRebound(Eigen::MatrixXd &optimal_points, double ts); // must be called after initControlPoints()

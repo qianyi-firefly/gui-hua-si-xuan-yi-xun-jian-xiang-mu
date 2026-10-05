@@ -10,6 +10,8 @@
 #include <thread>
 
 #include "imu_processing.hpp"
+#include "translation_observability.h"
+#include <std_msgs/Float64MultiArray.h>
 #include "ivox3d/ivox3d.h"
 #include "options.h"
 #include "pointcloud_preprocess.h"
@@ -98,6 +100,10 @@ private:
   double cube_len_             = 0;
   double filter_size_map_min_  = 0;
   bool   localmap_initialized_ = false;
+
+  double min_translation_support_ = 0.0;
+  TranslationObservability translation_observability_;
+  ros::Publisher pub_translation_observability_;
 
   /// params
   std::vector<double> extrinT_{ 3, 0.0 };  // lidar-imu translation
