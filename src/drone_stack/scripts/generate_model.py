@@ -131,12 +131,7 @@ def main():
     sub(rng, 'min', '0.1')
     sub(rng, 'max', '40')
     sub(rng, 'resolution', '0.02')
-    plugin = sub(sensor, 'plugin', name='mid360_ros_cloud', filename='libgazebo_ros_block_laser.so')
-    sub(plugin, 'robotNamespace', '/')
-    sub(plugin, 'alwaysOn', 'true')
-    sub(plugin, 'updateRate', '10')
-    sub(plugin, 'topicName', '/drone/sim/lidar/points')
-    sub(plugin, 'frameName', 'lidar')
+    # Native LaserScanStamped feeds the C++ frontend; no old block-laser plugin.
 
     imu = sub(base, 'sensor', name='mid360_imu', type='imu')
     sub(imu, 'pose', '0.27 0 0.10 0 0.5235987756 0')

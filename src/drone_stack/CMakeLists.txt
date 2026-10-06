@@ -3,19 +3,28 @@ project(drone_stack)
 set(CMAKE_CXX_STANDARD 14)
 set(CMAKE_AUTOMOC ON)
 find_package(catkin REQUIRED COMPONENTS
-  plan_env geometry_msgs message_generation mavros_msgs nav_msgs roscpp rviz
+  livox_ros_driver2 plan_env geometry_msgs message_generation mavros_msgs nav_msgs roscpp rviz
   sensor_msgs std_srvs visualization_msgs
 )
 find_package(Qt5 REQUIRED COMPONENTS Core Widgets)
-add_service_files(FILES Takeoff.srv LocalGoal.srv SetNavigationSpeed.srv QueueGoal.srv SetMaxFlightHeight.srv)
+find_package(gazebo REQUIRED)
+add_service_files(FILES Takeoff.srv LocalGoal.srv SetNavigationSpeed.srv QueueGoal.srv SetMaxFlightHeight.srv MapSession.srv)
 generate_messages(DEPENDENCIES geometry_msgs)
 catkin_package(CATKIN_DEPENDS plan_env geometry_msgs mavros_msgs nav_msgs roscpp rviz sensor_msgs std_srvs visualization_msgs message_runtime)
 include_directories(${catkin_INCLUDE_DIRS})
 add_executable(drone_operator_gui src/operator_gui.cpp)
 add_dependencies(drone_operator_gui ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
 target_link_libraries(drone_operator_gui Qt5::Core Qt5::Widgets ${catkin_LIBRARIES})
+add_library(drone_headless_xrandr_compat SHARED src/headless_xrandr_compat.c)
+target_link_libraries(drone_headless_xrandr_compat ${CMAKE_DL_LIBS})
+set_target_properties(drone_headless_xrandr_compat PROPERTIES AUTOMOC OFF)
+add_executable(sim_livox_native_adapter src/sim_livox_native_adapter.cpp)
+add_dependencies(sim_livox_native_adapter ${catkin_EXPORTED_TARGETS})
+target_include_directories(sim_livox_native_adapter SYSTEM PRIVATE ${GAZEBO_INCLUDE_DIRS})
+target_link_libraries(sim_livox_native_adapter ${catkin_LIBRARIES} ${GAZEBO_LIBRARIES})
 catkin_install_python(PROGRAMS scripts/lio_bridge.py scripts/flight_manager.py scripts/sim_livox_adapter.py
-  scripts/sim_camera_processor.py scripts/trajectory_guard.py scripts/safe_global_path.py
+  scripts/sim_camera_processor.py scripts/trajectory_guard.py scripts/voxel_map_client.py scripts/safe_global_path.py scripts/map_session.py scripts/build_simulation_scene_map.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
-install(TARGETS drone_operator_gui RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
+install(TARGETS drone_headless_xrandr_compat LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION})
+install(TARGETS drone_operator_gui sim_livox_native_adapter RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
 install(DIRECTORY launch config worlds models DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

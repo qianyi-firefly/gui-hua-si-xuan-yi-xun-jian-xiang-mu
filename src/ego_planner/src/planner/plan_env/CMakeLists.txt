@@ -15,13 +15,15 @@ find_package(catkin REQUIRED COMPONENTS
   mavros_msgs
   rospy
   std_msgs
+  geometry_msgs
   visualization_msgs
   cv_bridge
   message_filters
 )
 
-add_service_files(FILES MapArchive.srv)
-generate_messages()
+add_message_files(FILES VoxelUpdate.msg)
+add_service_files(FILES MapArchive.srv GetVoxelSnapshot.srv)
+generate_messages(DEPENDENCIES std_msgs geometry_msgs)
 
 find_package(Eigen3 REQUIRED)
 find_package(PCL 1.7 REQUIRED)
@@ -29,7 +31,7 @@ find_package(PCL 1.7 REQUIRED)
 catkin_package(
  INCLUDE_DIRS include
  LIBRARIES plan_env
- CATKIN_DEPENDS roscpp std_msgs mavros_msgs message_runtime
+ CATKIN_DEPENDS roscpp std_msgs geometry_msgs mavros_msgs message_runtime
 #  DEPENDS system_lib
 )
 

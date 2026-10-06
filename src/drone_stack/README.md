@@ -6,13 +6,13 @@
 src/drone_stack/scripts/start_simulation.sh
 ```
 
-该脚本启动 ROS 定位/规划/控制栈、PX4/Gazebo 和 Qt/RViz。`--no-gui` 可只启动后台仿真。按 Ctrl-C 会停止整组进程，包含后台 gzserver；禁止重复启动已有仿真。日志按运行时间保存在 `start/logs/`，最新一次为 `start/logs/latest/`。
+默认带图启动先打开ROS和Qt，确认出生位姿后才启动PX4/Gazebo。无图使用`DRONE_PREBUILT_MAP=`；后台在线使用`DRONE_PREBUILT_MAP= ... --no-gui`。按 Ctrl-C 会停止整组进程，包含后台 gzserver；禁止重复启动已有仿真。日志按运行时间保存在 `start/logs/`，最新一次为 `start/logs/latest/`。
 
 默认使用 `ROS_MASTER_URI=http://127.0.0.1:11311` 和 `ROS_HOSTNAME=127.0.0.1`，避免系统 `.bashrc` 的 `d.local` 与节点地址混用。跨机器使用时，通过 `DRONE_ROS_MASTER_URI` 和 `DRONE_ROS_HOSTNAME` 显式指定地址。
 
 ## 数据链路
 
-- Gazebo 雷达 → `/drone/sim/lidar/points` → Livox 适配 → `/livox/lidar` → Faster-LIO。
+- Gazebo原生LaserScanStamped测量时间/距离 → C++ `sim_livox_native_adapter` → `/livox/lidar` → Faster-LIO；旧ROS block-laser与Python逐点路径不参与默认启动。
 - Gazebo 雷达 IMU → `/drone/sim/lidar/imu_raw` → 启动稳定等待 → `/livox/imu` → Faster-LIO。
 - Faster-LIO `/Odometry` → 雷达到机体中心外参和初始世界方向变换 → `/drone/lio/odom`、`/mavros/odometry/out`。
 - PX4 `/mavros/local_position/odom` → EGO 与飞行管理器；桥接点云 `/drone/cloud_fcu_world` 使用同一数值坐标。
@@ -99,7 +99,7 @@ MID360 仿真传感器与独立 IMU 共用 `[0.27, 0, 0.10] m` 机体系平移�
 
 ## 静态障碍记忆
 
-无人机点云地图启用 `grid_map/retain_cloud_obstacles=true`。某帧缺少一个点并不能证明原位置为空，因此保留已观测静态占据，供盲区返程规划和执行保护使用；安全地图发布当前局部窗口所有记忆体素。没有自由空间射线清除模型，移动物体离开后会留下保守占据，重启地图清空。原点云输入新鲜度保护保持不变。
+无人机点云地图启用 `grid_map/retain_cloud_obstacles=true`。某帧缺少一个点并不能证明原位置为空，因此保留已观测静态占据，供盲区返程规划和执行保护使用；安全地图发布完整已知占据；原始证据由实测命中和自由射线更新，膨胀引用随原始占据增加/删除，不重复叠加旧膨胀。没有重新观测到的盲区继续保留。原点云输入新鲜度保护保持不变。
 
 静态点云记忆在管理器首次确认 READY 时清除初始化阶段的地图后启用，避免 PX4 本地原点收敛期间的占据残留。后续 HOLD/READY 不再清空已扫描障碍；没有自由空间射线证据时仍保留静态占据。
 
@@ -133,7 +133,7 @@ EGO优化、时间细化与最终发布前采用逐个三次Bezier控制凸包�
 
 - 沿当前全局曲线的剩余弧长进入接近阶段，默认0.8 m；高速时按制动距离扩大。实际EGO控制曲线重新规划减速，末段目标速度0.2 m/s，保留当前起始速度/加速度边界。末端精确到目标，期望速度与加速度为零；时间调整后再次检查物理可行性和完整碰撞。
 - 终点短轨迹最小长度降至0.02 m，消除原20 cm规划下限与15 cm到达容差之间的空档。不满足可行性或安全条件的短轨迹仍拒绝。
-- 到达条件统一覆盖规划、等待、转向与运动：XYZ三维球半径15 cm、速度不高于0.15 m/s、连续稳定1 s。确认期间取消旧规划回调影响，持续发送测得的到达位置/实际朝向悬停目标；离开容差后重新规划。
+- 到达条件统一覆盖规划、等待、转向与运动：XYZ三维球半径15 cm、速度不高于0.15 m/s、连续稳定1 s。确认期间取消旧规划回调影响，保持同一批准末段的安全零速度终点与原朝向；没有合格终点则保持测得位置。轻微离开15cm仅重置到达计时，超过20cm持续0.5s或收敛超过4s才重新申请短轨迹。最终到达仍要求15cm内低速稳定1s。
 - 合格的零速度终点允许最多3 s位置收敛。每个当前机体到终点的小跟踪段仍检查障碍、飞行范围及启用时的已观测自由空间；超过范围或视野不能直接修正。收敛超时再申请新规划，安全保护仍生效。
 - `/drone/navigation_terminal_stage`为独立状态话题：IDLE、CRUISE、APPROACH、CONVERGING、ARRIVAL_CONFIRM、COMPLETED。共享参数为`/drone/terminal_approach_distance_m`、`terminal_speed_mps`、`terminal_deceleration_mps2`、`terminal_settle_time_s`（后三项同一`/drone/`命名空间）。紫线仍来自真实批准控制样条。
 
@@ -160,3 +160,92 @@ Qt右侧新增“建图与预建地图导航”：
 ### 管理器曲线校验墙钟预算（2026-10-05）
 
 完整EGO曲线与执行前瞻的默认墙钟上限调整为2.0 s；线程CPU预算仍为0.05 s、递归节点上限仍为10000。检查在控制锁外进行，目标流继续；轨迹时间、地图新鲜度、碰撞检查和任务代次仍按原保护判定。全局参考平滑调用显式设置的0.15/0.5 s预算保持。Python已运行进程需重新启动才能使用新的默认值。
+
+## 终点滞回、实测自由射线与地图初始位姿（本次修改）
+
+修改前基线已推送 GitHub main：`11c9129`。以下改动在该提交之后，飞行效果待手动回归。
+
+### 终点
+
+最终到达门槛保持15cm三维球、速度≤0.15m/s、稳定1仿真秒。确认阶段独立退出半径默认20cm（`~arrival_exit_tolerance_m`），超过该半径持续0.5仿真秒或确认收敛超过`terminal_settle_time_s+1`秒才重规划。瞬时位置/速度/时间抖动重置稳定计时，保持朝向而不立即转头。小修正只能跟踪同一批准零速度终点，每周期继续检查碰撞、已观测自由空间与飞行范围；不安全修正停止执行。
+
+### 地图更新
+
+仿真适配器额外发布实际Gazebo射线 `/drone/sim/lidar/mapping_rays`，XYZ为雷达坐标，intensity=1为有效返回、0为仿真明确的最大量程无返回；近场、自身及无效测量不作为自由证据。它不进入Faster-LIO或EKF。桥接按扫描时刻配套FCU位姿和传感器外参转换至 `/drone/mapping/rays`，EGO地图与此时刻机体位姿ExactTime配对。
+
+地图先登记命中，再投射实测自由射线；只保护命中体素，不保护历史15cm回波邻域。无返回射线不登记障碍，只清除其实际穿过的体素；射线不延伸到真实返回之后。原始占据在2～3独立自由扫描后清除，对应膨胀引用同步扣减，未观测盲区不按时间清空。硬件无明确无返回射线时只处理有效返回，不将缺失Livox点视为无障碍。自由证据只保存到配置的导航范围（读取管理器goal_min_xyz/goal_max_xyz）；范围外射线仍清除原始占据，不产生无用自由体素传输。Qt体素显示Decay Time=0，更新替换当前帧。
+
+### 地图坐标与初始位姿
+
+`map_session.py`维护地面设置的`map → odom`刚体变换，不修改LIO输出、飞控EKF原点或ENU/NED转换。在线定位首次READY后自动将起始机体位置设为地图原点、初始朝向设为地图+X；返回在线/开始新建图时重新建立本次起点。
+
+预建地图使用流程：
+
+1. 地面上锁、READY、健康定位且目标队列为空。
+2. 选择`.dmap`，点击“打开预建地图预览”。地图仅预览，解锁和导航锁定。
+3. 点击“点选初始位置并拖动朝向”，鼠标按下选位置，拖动并松开确定地图中的机头方向。XYZ/yaw也可数值输入；roll/pitch来自重力估计。
+4. 点击“确认初始位姿并加载导航”。后端验证并变换预建原始占据，重新生成当前膨胀，确认成功后允许解锁和选点。
+5. 后续实时雷达持续更新地图。手动位姿对齐不是Faster-LIO自动地图重定位，初始位置/方向需与实际情况吻合。
+
+Qt固定显示帧为map，黄色/紫色真实曲线、机头、目标和点云使用同一变换。点选目标Z是地图Z；控制仍是当前ENU，允许高度范围由ENU导航下限和天花板换算。最高Z设置仍明确限制控制ENU高度。
+
+地图会话接口 `/drone/map_session` (`drone_stack/MapSession`)，操作prepare/load/new/online/save。`/drone/map_alignment_ready`门控管理器解锁及目标接收；`/drone/map_transform`是map中odom原点位姿，`/drone/map_session_status`提供就绪说明。`.dmap`新增DRONE_GRID_V2头保存当时map_from_odom平移/yaw；V1仍兼容，V1的保存坐标直接作为地图坐标。直接使用旧`/drone/map_archive`接口时需理解use_map_frame的变换含义，Qt统一通过地图会话操作。
+
+## 当前仿真场景预建地图启动
+
+已提供场景几何生成器，运行中的 Gazebo 可执行：
+
+```bash
+source devel/setup.bash
+rosrun drone_stack build_simulation_scene_map.py \
+  --world /home/d/robotproject/project0/src/drone_stack/worlds/inspection_demo.world \
+  --output /home/d/robotproject/project0/start/maps/inspection_demo_scene.dmap
+```
+
+随后停止上一套仿真，以该地图启动：
+
+```bash
+DRONE_PREBUILT_MAP=/home/d/robotproject/project0/start/maps/inspection_demo_scene.dmap \
+  bash src/drone_stack/scripts/start_simulation.sh
+```
+
+地图采用场景静态碰撞几何，包含四周墙体、两根立柱和黄色设备，分辨率10cm；这是完整障碍几何先验，不是飞行扫描地图。原始占据写入V2文件，加载后重新生成膨胀层，实际雷达继续更新。未伪造自由空间，执行前的观测自由检查仍生效。当前生成器支持仅绕Z旋转的静态方盒碰撞体，其他碰撞形状会报错。
+
+`DRONE_PREBUILT_MAP`用于选择仿真预建地图；最新版本改为先由Qt确认出生位姿再启动Gazebo（见下文最新流程）。定位达到READY/HEALTHY、落地未解锁后，核对实际出生位姿并加载地图，Qt默认地图文件同步。Gazebo真值仅用于这个初始地图坐标设置，不进入Faster-LIO、EKF或持续运动控制。实机仍使用Qt手动初始位置/朝向流程；启动不会自动解锁或起飞。
+
+## 仿真初始位姿与在线队列跳点（最新流程）
+
+默认运行 `bash src/drone_stack/scripts/start_simulation.sh` 为带图模式：先启动ROS及Qt，显示默认场景地图；Gazebo/PX4保持未启动。Qt中点选出生位置并拖动机头朝向（亦可输入XYZ/yaw），点击“确认初始位姿并启动仿真”后，才启动Gazebo并按所填世界ENU位姿生成机体。平地机体初始Z为0.15～0.20m，推荐0.17m；XY限制±8m，出生点距原始地图障碍至少0.55m。当前默认场景地图采用Gazebo世界ENU坐标。
+
+定位就绪后核对实际出生位姿，再对齐并加载地图，允许解锁。Faster-LIO仍在线定位，不做预建点云地图重定位；ENU/MAVROS和外部仅位姿融合保持现有约定。已启动的带图仿真不能仅通过修改地图TF变更出生位姿，需重启重新设置。自动加载只裁剪当前局部网格之外的地图部分；有效飞行范围内障碍仍保留。
+
+需要无图模式时，在启动前的Qt点击“返回在线建图导航”或“开始新建图”；也可用 `DRONE_PREBUILT_MAP= bash src/drone_stack/scripts/start_simulation.sh` 直接在线启动。没有GUI时可通过 `/drone/map_session` 服务提交出生位姿，启动器用墙钟等待，不依赖尚未存在的 `/clock`。
+
+在线模式中：已知障碍内的点在入队时拒绝，其余队列保留；前一点结束时，跳过被最新地图判为占据的后续点；正在前往的点被新扫描确认为占据时，停止旧规划和轨迹、进入HOLD，约0.3仿真秒后派发下一个点。后续点仍只在轮到它时规划；全部点被跳过则保持HOLD。地图/定位过期、离开OFFBOARD或其他安全异常继续执行原有取消/降落保护，带图模式的障碍点处理保留原有规则。
+
+## CPU优化与1秒EGO心跳门槛
+
+- EGO通过 `/grid_map/voxel_delta` (`plan_env/VoxelUpdate`)发布占据/自由体素的新增和删除ID；每次有效扫描有一个递增revision，即使几何没变也发布小型空增量，采集时间仍来自扫描。epoch在地图清空/重建后更新。`/grid_map/get_voxel_snapshot` (`plan_env/GetVoxelSnapshot`)为晚订阅或断序恢复提供完整同版本快照。
+- 管理器与全局规划器统一使用 `voxel_map_client.py`：验证坐标/网格/版本；断序立即使本地地图时间无效，再请求快照。占据与自由使用同一版本、不可变布尔位图；只复制发生变化的层，控制锁内仅交换引用。保留盲区障碍、原始占据确认、射线清除和保守膨胀。
+- `trajectory_guard.curve_geometry`按曲线几何缓存24组样条/分段多项式；位置/朝向和安全检查复用几何，地图/时间/碰撞结论不缓存，执行前仍检查最新地图和观测自由。
+- Qt体素显示4Hz，RViz渲染15FPS；规划地图每个扫描更新。旧安全/自由PointCloud2接口仅有订阅时生成兼容快照，常规控制不再订阅。默认仿真只打开Qt，Gazebo物理/雷达/相机后台运行；需要Gazebo窗口可使用 `DRONE_SHOW_GAZEBO=1` 启动。
+- 管理器 `~max_planner_age_s` 默认及launch值均为1.0sim秒，配置上限1.0；外部仅位姿融合、ENU/NED约定、连续OFFBOARD、碰撞保护不变。
+- 无图启动使用 `DRONE_PREBUILT_MAP= bash src/drone_stack/scripts/start_simulation.sh`。新增明确online_mode参数避免roslaunch对空地图路径回退默认值；默认带图仍先确认出生位姿。
+
+## 定位链路分段计时
+
+`DRONE_RECORD_LIO_TIMING=true`启动时启用计时；默认false，不改变采集时间、输入数据、滤波器、队列大小或飞行保护。诊断话题为 `/faster_lio/latency_timing`、`/drone/latency/lidar_adapter`、`/drone/latency/lio_bridge`、`/drone/latency/lidar_transport`。CPP记录各计算阶段的墙钟/进程CPU/主线程CPU，桥接记录锁等待；仿真前端另记录接收线程CPU。跨进程单调时钟仅适用于同一主机，仿真秒与墙钟秒分开分析。
+
+详细字段、帧BEGIN/END配对及本轮结果见DRONE_SIM_PROGRESS.md指向的timing_schema.json和lio_segment_timing_analysis.md。地面计时已发现Python前端成本及原Gazebo block-laser时间标签滞后；此次只部署探针，源时间戳修复和C++转换替换尚未实施。
+
+## 原生仿真雷达前端与最新健康时序
+
+当前 `lio.launch` 仅启动C++ `sim_livox_native_adapter`，直接订阅Gazebo原生LaserScanStamped，以引擎提供的测量时间生成Livox CustomMsg和实际建图射线。Gazebo block-laser旧ROS插件已从generate_model.py及生成模板移除，Python旧适配器仅保留历史源码，不参与默认启动。点云仍在lidar局部坐标，不读取world_pose或真值定位。
+
+MID360模型的10Hz、360×56射线、40m量程、前倾30°及安装位移保持。有效回波进入Livox，明确无返回射线进入建图流；近场与异常样本不产生自由证据，瞬时扫描的点统一位于包末，header/timebase为包起点、offset_time=0.1s。IMU、故障模拟服务及启动静置过滤均在C++前端保留。
+
+用户已明确选择健康时序：短暂异常警告，持续1sim秒取消任务进入HOLD，持续2sim秒降落，严重异常立即降落。管理器和LIO几何门槛使用一致配置；estimator_age上限仍2s，未修改；EGO心跳1s保持。数据过期门槛和这些持续异常计时属于不同设置。
+
+地面相近场景299帧：前端构造中位0.53ms，CPU约4.1%单核；位姿到桥接发布年龄中位22ms仿真时间、95分位30ms、最大46ms。仅为地面测量，飞行安全效果由本轮手动实验继续验证。
+
+所有显示器拔除时，Ogre1.9会因RandR空视频模式列表崩溃。启动器仅对自己的子进程启用libdrone_headless_xrandr_compat.so，使Ogre使用虚拟X屏幕尺寸，GPU渲染保留；桌面配置和系统库未修改。有已连接输出时不启用该兼容层。

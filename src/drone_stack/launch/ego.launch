@@ -8,7 +8,7 @@
     <arg name="odometry_topic" value="/mavros/local_position/odom"/>
     <arg name="camera_pose_topic" value="/drone/unused/camera_pose"/>
     <arg name="depth_topic" value="/drone/unused/depth"/>
-    <arg name="cloud_topic" value="/drone/cloud_fcu_world"/>
+    <arg name="cloud_topic" value="/drone/mapping/rays"/>
     <arg name="cx" value="320.0"/>
     <arg name="cy" value="240.0"/>
     <arg name="fx" value="400.0"/>

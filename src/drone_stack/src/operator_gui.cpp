@@ -1,4 +1,5 @@
 #include <plan_env/MapArchive.h>
+#include <drone_stack/MapSession.h>
 #include <QFileDialog>
 #include <QDir>
 #include <QLineEdit>
@@ -43,6 +44,7 @@
 
 #include <rviz/display.h>
 #include <rviz/display_group.h>
+#include <rviz/properties/property_tree_model.h>
 #include <rviz/render_panel.h>
 #include <rviz/tool.h>
 #include <rviz/tool_manager.h>
@@ -110,7 +112,14 @@ public:
     direct_land_client_ = nh_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     goal_client_ = nh_.serviceClient<drone_stack::QueueGoal>("/drone/queue_goal");
     speed_client_ = nh_.serviceClient<drone_stack::SetNavigationSpeed>("/drone/set_navigation_speed");
-    map_archive_client_ = nh_.serviceClient<plan_env::MapArchive>("/drone/map_archive");
+    map_session_client_ = nh_.serviceClient<drone_stack::MapSession>("/drone/map_session");
+    map_session_sub_ = nh_.subscribe<std_msgs::String>("/drone/map_session_status",1,[this](const std_msgs::String::ConstPtr& m){
+      const auto object=QJsonDocument::fromJson(QByteArray::fromStdString(m->data)).object();
+      std::lock_guard<std::mutex> guard(mutex_);map_session_mode_=object["mode"].toString();map_session_message_=object["message"].toString();alignment_ready_=object["ready"].toBool();
+    });
+    map_transform_sub_=nh_.subscribe<geometry_msgs::PoseStamped>("/drone/map_transform",1,[this](const geometry_msgs::PoseStamped::ConstPtr& m){
+      std::lock_guard<std::mutex> guard(mutex_);map_transform_=*m;map_transform_changed_=true;
+    });
     map_mode_sub_ = nh_.subscribe<std_msgs::String>("/drone/map_mode",1,[this](const std_msgs::String::ConstPtr& m){std::lock_guard<std::mutex> guard(mutex_);map_mode_=QString::fromStdString(m->data);});
     map_status_sub_ = nh_.subscribe<std_msgs::String>("/drone/map_status",1,[this](const std_msgs::String::ConstPtr& m){std::lock_guard<std::mutex> guard(mutex_);map_status_=QString::fromStdString(m->data);});
     ceiling_client_ = nh_.serviceClient<drone_stack::SetMaxFlightHeight>("/drone/set_max_flight_height");
@@ -197,13 +206,44 @@ private:
     view->subProp("Angle")->setValue(0.0);
     nav_msgs::Odometry odom;
     { std::lock_guard<std::mutex> guard(mutex_); odom = odom_; }
-    view->subProp("X")->setValue(odom.pose.pose.position.x);
-    view->subProp("Y")->setValue(odom.pose.pose.position.y);
+    const auto center=mapFromOdom(odom.pose.pose.position);
+    view->subProp("X")->setValue(center.x);
+    view->subProp("Y")->setValue(center.y);
     manager_->getToolManager()->setCurrentTool(manager_->getToolManager()->getDefaultTool());
+  }
+
+  geometry_msgs::Point mapFromOdom(const geometry_msgs::Point& p) const {
+    geometry_msgs::Point out;const double c=std::cos(map_yaw_view_),sn=std::sin(map_yaw_view_);
+    out.x=c*p.x-sn*p.y+map_translation_view_.x;out.y=sn*p.x+c*p.y+map_translation_view_.y;out.z=p.z+map_translation_view_.z;return out;
+  }
+  geometry_msgs::Point odomFromMap(const geometry_msgs::Point& p) const {
+    geometry_msgs::Point out;const double c=std::cos(map_yaw_view_),sn=std::sin(map_yaw_view_);
+    const double x=p.x-map_translation_view_.x,y=p.y-map_translation_view_.y;
+    out.x=c*x+sn*y;out.y=-sn*x+c*y;out.z=p.z-map_translation_view_.z;return out;
+  }
+  void publishInitialPose(bool show) {
+    visualization_msgs::MarkerArray markers;visualization_msgs::Marker m;
+    m.header.frame_id="map";m.header.stamp=ros::Time::now();m.ns="initial_pose";m.id=0;
+    m.type=visualization_msgs::Marker::ARROW;m.action=show?visualization_msgs::Marker::ADD:visualization_msgs::Marker::DELETE;
+    m.pose.position.x=map_dx_->value();m.pose.position.y=map_dy_->value();m.pose.position.z=map_dz_->value()+.1;
+    const double yaw=map_yaw_->value()*std::acos(-1.)/180.;m.pose.orientation.z=std::sin(yaw/2);m.pose.orientation.w=std::cos(yaw/2);
+    m.scale.x=.8;m.scale.y=.12;m.scale.z=.12;m.color.r=1.;m.color.a=1.;markers.markers.push_back(m);navigation_pub_.publish(markers);
   }
 
   bool eventFilter(QObject* watched, QEvent* event) override {
     if (watched == render_ && two_d_view_) {
+      if(picking_initial_pose_ && event->type()==QEvent::MouseMove){
+        if(initial_drag_active_){
+          auto* mouse=static_cast<QMouseEvent*>(event);
+          const auto ray=manager_->getViewManager()->getCurrent()->getCamera()->getCameraToViewportRay(
+            mouse->localPos().x()/std::max(1,render_->width()),mouse->localPos().y()/std::max(1,render_->height()));
+          const auto hit=ray.intersects(Ogre::Plane(Ogre::Vector3::UNIT_Z,0.));
+          if(hit.first){const auto p=ray.getPoint(hit.second);map_dx_->setValue(initial_drag_start_.x);map_dy_->setValue(initial_drag_start_.y);
+            if(std::hypot(p.x-initial_drag_start_.x,p.y-initial_drag_start_.y)>.1)map_yaw_->setValue(std::atan2(p.y-initial_drag_start_.y,p.x-initial_drag_start_.x)*180./std::acos(-1.));
+            publishInitialPose(true);}
+        }
+        return true;
+      }
       if (event->type() == QEvent::Wheel) {
         auto* wheel = static_cast<QWheelEvent*>(event);
         auto* scale = manager_->getViewManager()->getCurrent()->subProp("Scale");
@@ -213,6 +253,23 @@ private:
       }
       if (event->type() == QEvent::MouseButtonPress || event->type() == QEvent::MouseButtonRelease) {
         auto* mouse = static_cast<QMouseEvent*>(event);
+        if (picking_initial_pose_ && mouse->button()==Qt::LeftButton) {
+          const auto ray=manager_->getViewManager()->getCurrent()->getCamera()->getCameraToViewportRay(
+              mouse->localPos().x()/std::max(1,render_->width()),mouse->localPos().y()/std::max(1,render_->height()));
+          const auto hit=ray.intersects(Ogre::Plane(Ogre::Vector3::UNIT_Z,0.));
+          if(hit.first){
+            const auto p=ray.getPoint(hit.second);
+            if(event->type()==QEvent::MouseButtonPress){initial_drag_start_=p;initial_drag_active_=true;}
+            else if(initial_drag_active_){
+              map_dx_->setValue(initial_drag_start_.x);map_dy_->setValue(initial_drag_start_.y);
+              if(std::hypot(p.x-initial_drag_start_.x,p.y-initial_drag_start_.y)>.1)
+                map_yaw_->setValue(std::atan2(p.y-initial_drag_start_.y,p.x-initial_drag_start_.x)*180./std::acos(-1.));
+              initial_drag_active_=false;picking_initial_pose_=false;publishInitialPose(true);
+              log(QStringLiteral("初始位置与朝向已选择；点击确认初始位姿并加载导航。"));
+            }
+          }
+          return true;
+        }
         if (picking_goal_ && mouse->button() == Qt::LeftButton) {
           if (event->type() == QEvent::MouseButtonRelease) {
             const auto ray = manager_->getViewManager()->getCurrent()->getCamera()->getCameraToViewportRay(
@@ -222,7 +279,7 @@ private:
               const auto point = ray.getPoint(hit.second);
               std::lock_guard<std::mutex> guard(mutex_);
               if (!have_click_) {
-                pending_click_.header.frame_id = "odom"; pending_click_.header.stamp = ros::Time::now();
+                pending_click_.header.frame_id = "map"; pending_click_.header.stamp = ros::Time::now();
                 pending_click_.point.x = point.x; pending_click_.point.y = point.y;
                 have_click_ = true; pick_button_->setEnabled(false);
               }
@@ -291,7 +348,7 @@ private:
     material->getTechnique(0)->getPass(0)->setVertexColourTracking(Ogre::TVC_DIFFUSE);
     auto* object = manager_->getSceneManager()->createManualObject(materialName);
     object->setDynamic(true); object->setRenderQueueGroup(queue);
-    manager_->getSceneManager()->getRootSceneNode()->attachObject(object);
+    overlay_node_->attachObject(object);
     return object;
   }
 
@@ -378,7 +435,9 @@ private:
     render_->installEventFilter(this);
     manager_->initialize();
     manager_->getRootDisplayGroup()->setEnabled(true);
-    manager_->setFixedFrame("odom");
+    manager_->setFixedFrame("map");
+    overlay_node_=manager_->getSceneManager()->getRootSceneNode()->createChildSceneNode();
+    manager_->getDisplayTreeModel()->getRoot()->subProp("Global Options")->subProp("Frame Rate")->setValue(15);
     manager_->startUpdate();
     manager_->getViewManager()->setCurrentViewControllerType("rviz/Orbit");
     auto* view = manager_->getViewManager()->getCurrent();
@@ -393,6 +452,7 @@ private:
     // lidar map, EGO voxels and MAVROS odometry aligned in the same RViz view.
     addDisplay("rviz/PointCloud2", "MID360 点云", "/drone/cloud_fcu_world", "Points");
     addDisplay("rviz/PointCloud2", "EGO 体素", "/grid_map/occupancy_inflate", "Boxes");
+    addDisplay("rviz/PointCloud2", "预建地图预览", "/drone/prior_map_preview", "Boxes");
     // Explicit render queues implement the requested ordering independently
     // of camera angle and physical altitude. Geometry comes from real routes.
     yellow_layer_ = createRouteLayer("global_yellow", 95);
@@ -429,6 +489,7 @@ private:
     });
     connect(view2d, &QPushButton::clicked, this, [this] { picking_goal_ = false; showTopDown(); });
     connect(pickGoal, &QPushButton::clicked, this, [this] {
+      picking_initial_pose_=false;
       picking_goal_ = !picking_goal_;
       if (picking_goal_) showTopDown();
       log(picking_goal_ ? QStringLiteral("连续左键点选目标，按编号依次执行；滚轮缩放，Z使用右侧高度。再次点击按钮结束点选。") : QStringLiteral("已结束点选，现有目标队列继续执行。"));
@@ -494,7 +555,8 @@ private:
     map_mode_label_->setFixedHeight(64);
     map_mode_label_->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);
     mappingLayout->addWidget(map_mode_label_,0,0,1,2);
-    map_file_ = new QLineEdit(QDir::homePath()+QStringLiteral("/robotproject/project0/start/maps/inspection.dmap"),mapping);
+    std::string startupMap;nh_.param<std::string>("/drone/prebuilt_map_path",startupMap,"");
+    map_file_ = new QLineEdit(startupMap.empty()?QDir::homePath()+QStringLiteral("/robotproject/project0/start/maps/inspection.dmap"):QString::fromStdString(startupMap),mapping);
     mappingLayout->addWidget(map_file_,1,0,1,2);
     auto* browseMap = new QPushButton(QStringLiteral("选择地图文件"),mapping);
     mappingLayout->addWidget(browseMap,2,0,1,2);
@@ -502,18 +564,22 @@ private:
       const auto path=QFileDialog::getOpenFileName(this,QStringLiteral("选择预建导航地图"),map_file_->text(),QStringLiteral("导航地图 (*.dmap);;所有文件 (*)"));
       if(!path.isEmpty())map_file_->setText(path);
     });
-    map_dx_=spin(0.,mapping);map_dy_=spin(0.,mapping);map_dz_=spin(0.,mapping);map_yaw_=spin(0.,mapping);
+    map_dx_=spin(1.01,mapping);map_dy_=spin(.98,mapping);map_dz_=spin(.17,mapping);map_yaw_=spin(0.,mapping);
     map_dx_->setRange(-30.,30.);map_dy_->setRange(-30.,30.);map_dz_->setRange(-5.,5.);map_yaw_->setRange(-180.,180.);
     for(auto* input:{map_dx_,map_dy_,map_dz_})input->setSingleStep(.1);
-    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔX m")),3,0);mappingLayout->addWidget(map_dx_,3,1);
-    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔY m")),4,0);mappingLayout->addWidget(map_dy_,4,1);
-    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU ΔZ m")),5,0);mappingLayout->addWidget(map_dz_,5,1);
-    mappingLayout->addWidget(new QLabel(QStringLiteral("地图→当前ENU yaw °")),6,0);mappingLayout->addWidget(map_yaw_,6,1);
-    auto* mappingNote=new QLabel(QStringLiteral("地图必须与当前ENU对齐；相同仿真起点默认全零。先绕场扫描、落地上锁再保存。加载后仍使用实时雷达避障与Faster-LIO定位。"),mapping);mappingNote->setWordWrap(true);mappingNote->setFixedHeight(80);mappingNote->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);mappingLayout->addWidget(mappingNote,7,0,1,2);
-    const std::vector<std::pair<QString,std::string>> operations={{QStringLiteral("开始新建图"),"new"},{QStringLiteral("保存地图"),"save"},{QStringLiteral("加载地图导航"),"load"},{QStringLiteral("返回在线建图导航"),"online"}};
+    mappingLayout->addWidget(new QLabel(QStringLiteral("初始地图位置 X m")),3,0);mappingLayout->addWidget(map_dx_,3,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("初始地图位置 Y m")),4,0);mappingLayout->addWidget(map_dy_,4,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("初始地图位置 Z m")),5,0);mappingLayout->addWidget(map_dz_,5,1);
+    mappingLayout->addWidget(new QLabel(QStringLiteral("初始机头朝向 yaw °")),6,0);mappingLayout->addWidget(map_yaw_,6,1);
+    auto* mappingNote=new QLabel(QStringLiteral("默认预建地图：先点出生位置并拖朝向，确认后启动Gazebo。平地机体Z设0.17m。在线模式自动设本次起点。"),mapping);mappingNote->setWordWrap(true);mappingNote->setFixedHeight(80);mappingNote->setSizePolicy(QSizePolicy::Ignored,QSizePolicy::Fixed);mappingLayout->addWidget(mappingNote,7,0,1,2);
+    initial_pose_button_=new QPushButton(QStringLiteral("点选初始位置并拖动朝向"),mapping);
+    mappingLayout->addWidget(initial_pose_button_,8,0,1,2);
+    connect(initial_pose_button_,&QPushButton::clicked,this,[this]{picking_goal_=false;showTopDown();picking_initial_pose_=true;log(QStringLiteral("在地图上按下鼠标选位置，拖动并松开设置机头朝向。"));});
+    const std::vector<std::pair<QString,std::string>> operations={{QStringLiteral("开始新建图"),"new"},{QStringLiteral("保存地图"),"save"},{QStringLiteral("打开预建地图预览"),"prepare"},{QStringLiteral("确认初始位姿并加载导航"),"load"},{QStringLiteral("返回在线建图导航"),"online"}};
     for(size_t i=0;i<operations.size();++i){
       auto* button=new QPushButton(operations[i].first,mapping);map_buttons_.push_back(button);
-      mappingLayout->addWidget(button,8+int(i)/2,int(i)%2);
+      mappingLayout->addWidget(button,9+int(i)/2,int(i)%2);
+      if(operations[i].second=="load")initial_confirm_button_=button;
       const auto action=operations[i].second;
       connect(button,&QPushButton::clicked,this,[this,action]{
         QString path=map_file_->text();
@@ -524,10 +590,14 @@ private:
           if(!path.endsWith(QStringLiteral(".dmap")))path+=QStringLiteral(".dmap");
           map_file_->setText(path);
         }
-        plan_env::MapArchive service;service.request.action=action;service.request.path=path.toStdString();
-        service.request.offset_x=map_dx_->value();service.request.offset_y=map_dy_->value();service.request.offset_z=map_dz_->value();service.request.yaw_deg=map_yaw_->value();
-        if(!map_archive_client_.call(service))log(QStringLiteral("地图服务不可用"));
-        else log(QString::fromStdString(service.response.message));
+        drone_stack::MapSession service;service.request.action=action;service.request.path=path.toStdString();
+        service.request.x=map_dx_->value();service.request.y=map_dy_->value();service.request.z=map_dz_->value();service.request.yaw_deg=map_yaw_->value();
+        if(!map_session_client_.call(service))log(QStringLiteral("地图会话服务不可用"));
+        else {
+          log(QString::fromStdString(service.response.message));
+          if(service.response.success && action=="prepare") {picking_goal_=false;showTopDown();manager_->getViewManager()->getCurrent()->subProp("X")->setValue(0.);manager_->getViewManager()->getCurrent()->subProp("Y")->setValue(0.);}
+          if(service.response.success && action!="prepare"){picking_initial_pose_=false;publishInitialPose(false);}
+        }
       });
     }
     sideLayout->addWidget(mapping);
@@ -547,7 +617,7 @@ private:
     auto* sendRelative = new QPushButton(QStringLiteral("发送相对目标"), goals);
     goal_button_ = sendRelative;
     goalLayout->addWidget(sendRelative, 3, 0, 1, 2);
-    goalLayout->addWidget(new QLabel(QStringLiteral("点选目标绝对 Z m")), 4, 0);
+    goalLayout->addWidget(new QLabel(QStringLiteral("点选目标地图 Z m")), 4, 0);
     goalLayout->addWidget(clicked_height_, 4, 1);
     queue_status_ = new QLabel(QStringLiteral("剩余目标：0（含当前）"), goals);
     goalLayout->addWidget(queue_status_, 5, 0, 1, 2);
@@ -588,7 +658,7 @@ private:
       if (!ceiling_client_.call(srv)) { log(QStringLiteral("最高高度设置服务不可用")); return; }
       log(QString::fromStdString(srv.response.message));
       maximum_height_->setValue(srv.response.height_m);
-      clicked_height_->setMaximum(srv.response.height_m-.20);
+      clicked_height_->setMaximum(srv.response.height_m-.20+map_translation_view_.z);
     });
     connect(takeoff, &QPushButton::clicked, this, [this] {
       drone_stack::Takeoff srv;
@@ -651,6 +721,7 @@ private:
     if (!style.isEmpty()) if (auto* property = display->subProp("Style")) property->setValue(style);
     if (cls == "rviz/Odometry") display->subProp("Keep")->setValue(1);
     if (cls == "rviz/PointCloud2") {
+      display->subProp("Decay Time")->setValue(0.0);
       // Simulation intensity is constant, so use explicit colours rather
       // than automatically normalising an empty or zero-width intensity range.
       display->subProp("Color Transformer")->setValue("FlatColor");
@@ -753,13 +824,14 @@ private:
     mavros_msgs::State state;
     sensor_msgs::BatteryState battery;
     std::string phase, lioQuality;
-    QString error, mapMode, mapStatus;
+    QString error, mapMode, mapStatus,sessionMode,sessionMessage;
+    bool alignmentReady=false,transformChanged=false;geometry_msgs::PoseStamped mapTransform;
     nav_msgs::Path queue;
     bool queueUpdate = false, ceilingUpdate = false;
     double ceiling = 2.5;
     {
       std::lock_guard<std::mutex> guard(mutex_);
-      mapMode=map_mode_;mapStatus=map_status_;
+      mapMode=map_mode_;mapStatus=map_status_;sessionMode=map_session_mode_;sessionMessage=map_session_message_;alignmentReady=alignment_ready_;mapTransform=map_transform_;transformChanged=map_transform_changed_;map_transform_changed_=false;
       state = state_; battery = battery_; phase = phase_; odom = odom_;
       front = front_; down = down_; frontStamp = front_stamp_; downStamp = down_stamp_;
       authorized = authorized_; lio = lio_valid_;
@@ -773,6 +845,21 @@ private:
       error = pending_error_; pending_error_.clear();
       queueUpdate = have_queue_update_; queue = queue_message_; have_queue_update_ = false;
       ceilingUpdate = have_ceiling_update_; ceiling = ceiling_value_; have_ceiling_update_ = false;
+    }
+    if(transformChanged){
+      map_translation_view_=mapTransform.pose.position;const auto& q=mapTransform.pose.orientation;
+      map_yaw_view_=std::atan2(2*(q.w*q.z+q.x*q.y),1-2*(q.y*q.y+q.z*q.z));
+      overlay_node_->setPosition(Ogre::Vector3(map_translation_view_.x,map_translation_view_.y,map_translation_view_.z));
+      overlay_node_->setOrientation(Ogre::Quaternion(Ogre::Radian(map_yaw_view_),Ogre::Vector3::UNIT_Z));
+      clicked_height_->setRange(.5+map_translation_view_.z,ceiling_value_-.2+map_translation_view_.z);
+      clicked_height_->setToolTip(QStringLiteral("地图坐标Z；控制时转换为当前ENU。允许范围随初始位姿和ENU天花板变化。"));
+    }
+    const bool showPrior=sessionMode=="ALIGNING" || sessionMode=="WAITING_POSE" || sessionMode=="STARTING_SIM";
+    displays_["预建地图预览"]->setEnabled(showPrior);
+    const bool showLive=!showPrior;
+    // Respect existing visibility toggles; only force-hide while aligning.
+    if(showLive!=live_view_enabled_){
+      displays_["MID360 点云"]->setEnabled(showLive);displays_["EGO 体素"]->setEnabled(showLive);live_view_enabled_=showLive;
     }
     if (!error.isEmpty()) log(error);
     if (!error.isEmpty()) last_error_ = error;
@@ -805,7 +892,7 @@ private:
     const bool flightReady = state.connected && lio && managerFresh && poseFresh;
     auth_button_->setEnabled(state.connected && managerFresh);
     if (ceilingUpdate) {
-      maximum_height_->setValue(ceiling); clicked_height_->setMaximum(ceiling-.20);
+      maximum_height_->setValue(ceiling); clicked_height_->setMaximum(ceiling-.20+map_translation_view_.z);
       maximum_height_->setToolTip(QStringLiteral("当前已生效天花板：%1 m ENU Z；目标及规划上限：%2 m。地面或无任务的健康HOLD时可修改。")
         .arg(ceiling,0,'f',2).arg(ceiling-.20,0,'f',2));
     }
@@ -837,15 +924,22 @@ private:
       planned_path_.clear(); actual_path_.clear(); publishNavigation();
       queue_status_->setText(QStringLiteral("剩余目标：0（任务中止）"));
     }
-    goal_button_->setEnabled(flightReady && authorized && state.armed &&
+    goal_button_->setEnabled(alignmentReady && flightReady && authorized && state.armed &&
                             (phase == "HOLD" || phase == "NAVIGATING") && queued_points_.size() < 100);
     ceiling_button_->setEnabled(state.connected && managerFresh &&
                                (!state.armed || (flightReady && phase == "HOLD" && !goal_busy_)));
     map_mode_label_->setText(QStringLiteral("%1\n%2").arg(mapMode=="PRIOR_NAV"?QStringLiteral("预建地图导航"):mapMode=="MAPPING"?QStringLiteral("在线建图导航"):QStringLiteral("地图模式等待中"),mapStatus));
-    map_mode_label_->setToolTip(mapStatus);
-    const bool mapEditable=flightReady && !state.armed && phase=="READY" && lioQuality=="HEALTHY";
+    map_mode_label_->setText(sessionMessage+QStringLiteral("\n")+(alignmentReady?QStringLiteral("地图坐标就绪"):QStringLiteral("初始位姿未确认，导航锁定")));
+    map_mode_label_->setToolTip(sessionMessage+QStringLiteral("\n")+mapStatus);
+    const bool bootPending=sessionMode=="WAITING_POSE";
+    const bool mapEditable=bootPending || (flightReady && !state.armed && phase=="READY" && lioQuality=="HEALTHY");
     for(auto* button:map_buttons_)button->setEnabled(mapEditable);
-    arm_button_->setEnabled(flightReady && authorized && !state.armed && phase == "READY");
+    initial_pose_button_->setEnabled(mapEditable && (sessionMode=="ALIGNING" || bootPending));
+    initial_confirm_button_->setEnabled(mapEditable && (sessionMode=="ALIGNING" || bootPending));
+    initial_confirm_button_->setText(bootPending?QStringLiteral("确认初始位姿并启动仿真"):QStringLiteral("确认初始位姿并加载导航"));
+    if(bootPending && map_buttons_.size()>1)map_buttons_[1]->setEnabled(false);
+    if(!mapEditable)picking_initial_pose_=false;
+    arm_button_->setEnabled(alignmentReady && flightReady && authorized && !state.armed && phase == "READY");
     takeoff_button_->setEnabled(flightReady && authorized && state.armed && phase == "ARMED");
     const bool canHold = flightReady && state.armed &&
         (phase == "TAKEOFF" || phase == "HOLD" || phase == "NAVIGATING");
@@ -862,8 +956,8 @@ private:
       geometry_msgs::PoseStamped goal;
       goal.header.frame_id = "odom";
       goal.header.stamp = ros::Time::now();
-      goal.pose.position = clicked.point;
-      goal.pose.position.z = clicked_height_->value();
+      auto mapPoint=clicked.point;mapPoint.z=clicked_height_->value();
+      goal.pose.position = odomFromMap(mapPoint);
       goal.pose.orientation = odom.pose.pose.orientation;
       submit(goal);
       }
@@ -926,7 +1020,7 @@ private:
         purple_layer_->clear();
       if(phase!="NAVIGATING" || !managerFresh || !fresh(yellow_stamp_,yellow_receipt_,2.0)) yellow_layer_->clear();
     }
-    drawHeadingLayer(odom,poseFresh);
+    drawHeadingLayer(odom,poseFresh && !showPrior);
     manager_->queueRender();
     if (overlayChanged) publishNavigation();
     const bool rosOnline = ros::master::check();
@@ -951,15 +1045,18 @@ private:
     cards_["雷达/EGO"]->setText(QStringLiteral("雷达/EGO\n%1 / %2").arg(cloudFresh ? QStringLiteral("点云在线") : QStringLiteral("点云断流"), mapFresh ? QStringLiteral("体素在线") : QStringLiteral("体素断流")));
     const auto& q = odom.pose.pose.orientation;
     const double yaw = std::atan2(2.0*(q.w*q.z+q.x*q.y), 1.0-2.0*(q.y*q.y+q.z*q.z))*180.0/3.141592653589793;
-    telemetry_->setText(QStringLiteral("飞行阶段：%1  |  ENU X %2  Y %3  Z %4 m  |  航向 %5°  |  %6")
+    const auto mapPosition=mapFromOdom(odom.pose.pose.position);
+    telemetry_->setText(QStringLiteral("飞行阶段：%1  |  地图 X %2  Y %3  Z %4 m  |  地图航向 %5°  |  %6")
         .arg(managerFresh ? QString::fromStdString(phase) : QStringLiteral("管理器离线"))
-        .arg(poseFresh ? QString::number(odom.pose.pose.position.x, 'f', 2) : "--")
-        .arg(poseFresh ? QString::number(odom.pose.pose.position.y, 'f', 2) : "--")
-        .arg(poseFresh ? QString::number(odom.pose.pose.position.z, 'f', 2) : "--")
-        .arg(poseFresh ? QString::number(yaw, 'f', 1) : "--")
+        .arg(poseFresh ? QString::number(mapPosition.x, 'f', 2) : "--")
+        .arg(poseFresh ? QString::number(mapPosition.y, 'f', 2) : "--")
+        .arg(poseFresh ? QString::number(mapPosition.z, 'f', 2) : "--")
+        .arg(poseFresh ? QString::number(std::remainder(yaw+map_yaw_view_*180./std::acos(-1.),360.), 'f', 1) : "--")
         .arg(use_sim_time_ ? QStringLiteral("仿真") : QStringLiteral("实机连接")));
     QString reason;
-    if (!clockHealthy) reason = clock_fault_ ? QStringLiteral("仿真时钟倒退，请重启界面并检查仿真") : QStringLiteral("仿真时钟未开始或已冻结");
+    if (bootPending) reason = QStringLiteral("请在右侧地图栏设置出生位置和朝向，点击确认后才启动Gazebo");
+    else if (sessionMode=="STARTING_SIM") reason = QStringLiteral("正在按所设位姿启动仿真，等待定位和地图就绪");
+    else if (!clockHealthy) reason = clock_fault_ ? QStringLiteral("仿真时钟倒退，请重启界面并检查仿真") : QStringLiteral("仿真时钟未开始或已冻结");
     else if (!state.connected) reason = QStringLiteral("等待 PX4 连接");
     else if (!managerFresh) reason = QStringLiteral("飞行管理器离线；普通操作禁用");
     else if (!lio) reason = QStringLiteral("等待有效 LIO 定位");
@@ -1026,7 +1123,17 @@ private:
   std::string lio_quality_ = "UNKNOWN";
   ros::Subscriber cloud_sub_, map_sub_, heartbeat_sub_, state_sub_, odom_sub_, battery_sub_, lio_sub_, phase_sub_, auth_sub_, error_sub_, front_sub_, down_sub_, clicked_sub_;
   ros::ServiceClient auth_client_, arm_client_, takeoff_client_, hold_client_, cancel_client_, land_client_, goal_client_;
-  ros::ServiceClient map_archive_client_;
+  ros::ServiceClient map_session_client_;
+  ros::Subscriber map_session_sub_,map_transform_sub_;
+  QString map_session_mode_,map_session_message_;
+  geometry_msgs::PoseStamped map_transform_;
+  geometry_msgs::Point map_translation_view_;
+  double map_yaw_view_=0.;
+  bool alignment_ready_=false,map_transform_changed_=false,picking_initial_pose_=false,initial_drag_active_=false,live_view_enabled_=true;
+  Ogre::Vector3 initial_drag_start_;
+  Ogre::SceneNode* overlay_node_=nullptr;
+  QPushButton* initial_pose_button_=nullptr;
+  QPushButton* initial_confirm_button_=nullptr;
   ros::Subscriber map_mode_sub_,map_status_sub_;
   QString map_mode_,map_status_;
   QLabel* map_mode_label_=nullptr;

@@ -17,9 +17,9 @@ from std_msgs.msg import String, Float64
 from visualization_msgs.msg import Marker, MarkerArray
 from geometry_msgs.msg import Point
 from ego_planner.msg import Bspline, GlobalRoute
-from scipy.interpolate import BSpline
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from trajectory_guard import PackedCells, validate_curve, MapConversionCache
+from trajectory_guard import PackedCells, validate_curve, curve_geometry
+from voxel_map_client import VoxelMapClient
 from flight_manager import FlightManager
 
 class ReferenceSafetyCells:
@@ -46,7 +46,6 @@ class SafeGlobalPath:
         self.route_curve_id=None; self.last_publish_wall=0.; self.retry_wall=0.
         self.reference_route=[]; self.reference_progress=0.; self.progress_pose=None; self.route_version=0
         self.phase=''; self.curve=None; self.path=[]; self.map_stamp=rospy.Time(0); self.map_wall=0
-        self.occupied_conversion=MapConversionCache(); self.free_conversion=MapConversionCache()
         self.generation=0; self.last_clock=0; self.clock_wall=time.monotonic(); self.clock_fault=False
         self.origin=[-rospy.get_param('/ego_planner_node/grid_map/map_size_x',30.)/2,
                      -rospy.get_param('/ego_planner_node/grid_map/map_size_y',30.)/2,
@@ -69,8 +68,7 @@ class SafeGlobalPath:
         # The bridge exposes FCU numeric ENU coordinates as odom, exactly like
         # cloud_fcu_world. MAVROS's original local_position topic is labelled map.
         rospy.Subscriber('/drone/fcu/odom',Odometry,self.on_odom,queue_size=1,tcp_nodelay=True)
-        rospy.Subscriber('/grid_map/observed_free',PointCloud2,self.on_free,queue_size=1,buff_size=8*1024*1024,tcp_nodelay=True)
-        rospy.Subscriber('/grid_map/occupancy_inflate_safety',PointCloud2,self.on_map,queue_size=1,buff_size=8*1024*1024,tcp_nodelay=True)
+        self.voxel_client=VoxelMapClient(self.origin,self.res,self.shape,self.on_voxel_map,self.invalidate_voxel_map)
         threading.Thread(target=self.run,daemon=True).start()
 
     def on_ceiling(self,message):
@@ -143,7 +141,6 @@ class SafeGlobalPath:
                 self.goal=None;self.generation+=1;self.curve=None;self.search=None
                 self.reference_route=[];self.reference_progress=0.;self.progress_pose=None
                 self.cells=None;self.free=None
-                self.occupied_conversion=MapConversionCache();self.free_conversion=MapConversionCache()
                 self.clear('导航已结束')
 
     def on_stage(self,m):
@@ -164,35 +161,16 @@ class SafeGlobalPath:
             if (self.goal is not None and self.phase=='NAVIGATING' and self.stage=='TRACKING' and
                     m.start_time>=self.curve_epoch):self.curve=m
 
-    def on_map(self,m):
-        if m.header.frame_id!='odom' or m.header.stamp==rospy.Time(0):return
+    def on_voxel_map(self,occupied,free,stamp,epoch,revision):
         with self.lock:
-            if self.goal is None or m.header.stamp<=self.map_stamp:return
-            generation=self.generation;cache=self.occupied_conversion
-        try:cells=cache.convert(m,self.origin,self.res,self.shape)
-        except (ValueError,TypeError,IndexError):
-            with self.lock:
-                if generation==self.generation and self.goal is not None:
-                    self.cells=None;self.clear('地图格式异常，安全路径不可用')
-            return
-        with self.lock:
-            if generation!=self.generation or self.goal is None or m.header.stamp<=self.map_stamp:return
-            if self.cells is None or self.cells.occupied is not cells:
-                self.cells=ReferenceSafetyCells(cells)
-            self.map_stamp=m.header.stamp;self.map_wall=time.monotonic()
+            if self.goal is None or stamp<self.map_stamp:return
+            if self.cells is None or self.cells.occupied is not occupied:self.cells=ReferenceSafetyCells(occupied)
+            self.free=free;self.map_stamp=stamp;self.free_stamp=stamp
+            self.map_wall=time.monotonic();self.free_wall=self.map_wall
 
-
-    def on_free(self,m):
-        if m.header.frame_id!='odom' or m.header.stamp==rospy.Time(0):return
+    def invalidate_voxel_map(self):
         with self.lock:
-            if self.goal is None or m.header.stamp<=self.free_stamp:return
-            generation=self.generation;cache=self.free_conversion
-        try:free=cache.convert(m,self.origin,self.res,self.shape)
-        except (ValueError,TypeError,IndexError):free=None
-        with self.lock:
-            if generation!=self.generation or self.goal is None or m.header.stamp<=self.free_stamp:return
-            self.free=free;self.free_stamp=m.header.stamp;self.free_wall=time.monotonic()
-
+            self.cells=None;self.free=None;self.map_stamp=rospy.Time(0);self.free_stamp=rospy.Time(0)
 
     def segment_safe(self,a,b,cells):
         if not all(math.isfinite(v) and lo-1e-9<=v<=hi+1e-9 for p in (a,b) for v,lo,hi in zip(p,self.lower,self.upper)):return False
@@ -271,7 +249,7 @@ class SafeGlobalPath:
             pts=np.array([[p.x,p.y,p.z] for p in curve.pos_pts]);knots=np.array(curve.knots)
             begin=knots[3]+max(0.,age);end=knots[len(pts)]
             if begin>=end:return [start]
-            f=BSpline(knots,pts,3);values=f(np.linspace(begin,end,min(256,max(2,int((end-begin)/.1)+1))))
+            f=curve_geometry(curve)[3];values=f(np.linspace(begin,end,min(256,max(2,int((end-begin)/.1)+1))))
             route=[start]+[tuple(p) for p in values]
             if math.dist(start,route[1])>.75 or not self.route_safe(route,cells):return [start]
             return route

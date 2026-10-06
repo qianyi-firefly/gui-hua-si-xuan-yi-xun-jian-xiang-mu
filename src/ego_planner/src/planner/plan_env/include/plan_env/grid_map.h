@@ -12,6 +12,8 @@
 #include <queue>
 #include <unordered_set>
 #include <plan_env/MapArchive.h>
+#include <plan_env/VoxelUpdate.h>
+#include <plan_env/GetVoxelSnapshot.h>
 #include <mavros_msgs/State.h>
 #include <mavros_msgs/ExtendedState.h>
 #include <nav_msgs/Path.h>
@@ -63,6 +65,7 @@ struct MappingParameters {
   bool retain_cloud_obstacles_;
   bool require_observed_free_;
   Eigen::Vector3d cloud_sensor_offset_, cloud_body_half_extent_;
+  Eigen::Vector3d free_evidence_min_,free_evidence_max_;
   string frame_id_;
   int pose_type_;
 
@@ -204,6 +207,16 @@ private:
   MappingData md_;
   bool cloud_memory_started_ = true;
   std::unordered_set<int> navigation_cells_;
+  std::unordered_set<int> dirty_voxels_;
+  std::vector<unsigned char> published_occupied_, published_free_;
+  bool voxel_full_pending_ = true;
+  uint64_t voxel_epoch_ = 0, voxel_revision_ = 0;
+  ros::Time voxel_stamp_, last_visual_stamp_;
+  ros::Publisher voxel_delta_pub_;
+  ros::ServiceServer voxel_snapshot_service_;
+  void publishVoxelDelta();
+  bool voxelSnapshotCallback(plan_env::GetVoxelSnapshot::Request&, plan_env::GetVoxelSnapshot::Response&);
+  void fillVoxelMetadata(plan_env::VoxelUpdate& message) const;
   ros::ServiceServer map_archive_service_;
   ros::Publisher map_mode_pub_, map_archive_status_pub_;
   ros::Subscriber archive_state_sub_, archive_landed_sub_, archive_phase_sub_, archive_health_sub_, archive_queue_sub_;

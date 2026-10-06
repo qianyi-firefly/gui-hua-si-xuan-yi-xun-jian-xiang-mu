@@ -3,24 +3,28 @@
 import math
 import time
 import numpy as np
-from scipy.interpolate import PPoly
+from scipy.interpolate import PPoly, BSpline
+from functools import lru_cache
 
 
 
 class PackedCells:
     """Immutable voxel membership without one Python tuple per map point."""
-    def __init__(self, codes, shape):
+    def __init__(self, codes, shape, bitmap=False):
+        self.bitmap=bitmap
+        self.count=int(np.count_nonzero(codes)) if bitmap else len(codes)
         self.codes = codes
         self.shape = tuple(int(v) for v in shape)
 
     def __contains__(self, cell):
         x,y,z = (int(v) for v in cell)
         nx,ny,nz = self.shape
-        return (0 <= x < nx and 0 <= y < ny and 0 <= z < nz and
-                (x*ny+y)*nz+z in self.codes)
+        if not (0 <= x < nx and 0 <= y < ny and 0 <= z < nz):return False
+        code=(x*ny+y)*nz+z
+        return bool(self.codes[code]) if self.bitmap else code in self.codes
 
     def __len__(self):
-        return len(self.codes)
+        return self.count
 
     @classmethod
     def from_cloud(cls, msg, origin, resolution, shape):
@@ -65,19 +69,36 @@ class MapConversionCache:
         return cells
 
 
+@lru_cache(maxsize=24)
+def _curve_geometry(order, knots_tuple, points_tuple):
+    knots=np.asarray(knots_tuple,dtype=float);points=np.asarray(points_tuple,dtype=float)
+    if (order!=3 or points.ndim!=2 or points.shape[1]!=3 or not 4<=len(points)<=256 or
+            len(knots)!=len(points)+4 or not np.isfinite(points).all() or not np.isfinite(knots).all() or
+            np.any(np.diff(knots)<0) or not 0<knots[len(points)]-knots[3]<=120):
+        raise ValueError('Malformed or unsupported EGO B-spline')
+    polynomials=tuple(PPoly.from_spline((knots,points[:,axis],3)) for axis in range(3))
+    # Installed SciPy evaluates through a writable Cython memoryview. Keep
+    # dedicated writable spline buffers; freeze only the shared geometry data.
+    spline=BSpline(knots.copy(),points.copy(),order,extrapolate=False)
+    knots.setflags(write=False);points.setflags(write=False)
+    return knots,points,polynomials,spline
+
+
+def curve_geometry(message):
+    # Cache geometry only. Timestamps, task IDs and map checks are never cached.
+    return _curve_geometry(message.order,tuple(message.knots),
+                           tuple((p.x,p.y,p.z) for p in message.pos_pts))
+
+
 def validate_curve(message, occupied, origin, resolution, lower, upper,
                    wall_budget=2.0, node_budget=10000, cpu_budget=.05, stats=None, observed_free=None, curve_window=None):
     begin = time.monotonic()
     cpu_begin = time.thread_time()
     nodes = 0
     try:
-        knots = np.asarray(message.knots, dtype=float)
-        points = np.asarray([[p.x, p.y, p.z] for p in message.pos_pts], dtype=float)
-        if (message.order != 3 or points.ndim != 2 or points.shape[1] != 3 or
-                not 4 <= len(points) <= 256 or len(knots) != len(points)+4 or
-                not np.isfinite(points).all() or not np.isfinite(knots).all() or
-                np.any(np.diff(knots) < 0) or not math.isfinite(resolution) or resolution <= 0):
-            return 'Malformed or unsupported EGO B-spline'
+        knots,points,polynomials,_=curve_geometry(message)
+        if not math.isfinite(resolution) or resolution<=0:
+            return 'Invalid map resolution'
         start, end = knots[3], knots[len(points)]
         if not 0 < end-start <= 120:
             return 'Invalid EGO B-spline duration'
@@ -86,7 +107,6 @@ def validate_curve(message, occupied, origin, resolution, lower, upper,
             if len(curve_window)!=2 or not all(math.isfinite(v) for v in curve_window) or not 0 <= curve_window[0] < curve_window[1]:
                 return 'Invalid EGO curve validation window'
             window_start=max(start,start+curve_window[0]);window_end=min(end,start+curve_window[1])
-        polynomials = [PPoly.from_spline((knots, points[:,axis], 3)) for axis in range(3)]
         origin = np.asarray(origin)
         lower, upper = np.asarray(lower), np.asarray(upper)
         nodes = 0

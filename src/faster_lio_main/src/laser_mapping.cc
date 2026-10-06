@@ -3,12 +3,27 @@
 #include <execution>
 #include <fstream>
 #include <iomanip>
+#include <chrono>
+#include <time.h>
+#include <sensor_msgs/PointCloud.h>
 
 #include "laser_mapping.h"
 #include "utils.h"
 
 namespace faster_lio
 {
+namespace {
+struct TimingMark { double wall, process, thread; };
+double cpuSeconds(clockid_t id) { timespec t{};clock_gettime(id,&t);return t.tv_sec+t.tv_nsec*1e-9; }
+TimingMark timingMark() {
+  return {std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+          cpuSeconds(CLOCK_PROCESS_CPUTIME_ID),cpuSeconds(CLOCK_THREAD_CPUTIME_ID)};
+}
+void recordStage(std::array<double,42>& v,int offset,const TimingMark& begin) {
+  const auto end=timingMark();v[offset]=end.wall-begin.wall;v[offset+1]=end.process-begin.process;v[offset+2]=end.thread-begin.thread;
+}
+}
+
 
 bool LaserMapping::InitROS(ros::NodeHandle &nh)
 {
@@ -304,21 +319,22 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh)
   nh.param<std::string>("common/lid_topic", lidar_topic, "/livox/lidar");
   nh.param<std::string>("common/imu_topic", imu_topic, "/livox/imu");
 
+  nh.param("/drone/record_lio_latency",latency_enabled_,false);
   if(preprocess_->GetLidarType() == LidarType::AVIA)
   {
-    sub_pcl_ = nh.subscribe<livox_ros_driver2::CustomMsg>(
-      lidar_topic, 200000,
-      [this](const livox_ros_driver2::CustomMsg::ConstPtr &msg) {
-        LivoxPCLCallBack(msg);
-      });
+    using Event=ros::MessageEvent<livox_ros_driver2::CustomMsg const>;
+    ros::SubscribeOptions options;
+    options.initByFullCallbackType<const Event&>(lidar_topic,200000,
+      [this](const Event& e){LivoxPCLCallBack(e.getMessage(),e.getReceiptTime().toSec());});
+    sub_pcl_=nh.subscribe(options);
   }
   else
   {
-    sub_pcl_ = nh.subscribe<sensor_msgs::PointCloud2>(
-      lidar_topic, 200000,
-      [this](const sensor_msgs::PointCloud2::ConstPtr &msg) {
-        StandardPCLCallBack(msg);
-      });
+    using Event=ros::MessageEvent<sensor_msgs::PointCloud2 const>;
+    ros::SubscribeOptions options;
+    options.initByFullCallbackType<const Event&>(lidar_topic,200000,
+      [this](const Event& e){StandardPCLCallBack(e.getMessage(),e.getReceiptTime().toSec());});
+    sub_pcl_=nh.subscribe(options);
   }
 
   sub_imu_ = nh.subscribe<sensor_msgs::Imu>(
@@ -329,6 +345,22 @@ void LaserMapping::SubAndPubToROS(ros::NodeHandle &nh)
   path_.header.stamp    = ros::Time::now();
   path_.header.frame_id = "camera_init";
 
+  if(latency_enabled_)pub_latency_timing_=nh.advertise<std_msgs::Float64MultiArray>("/faster_lio/latency_timing",50);
+  bool native_frontend=false;nh.param("/drone/native_lidar_frontend",native_frontend,false);
+  if(latency_enabled_ && !native_frontend) {
+    // Diagnostic-only raw transport receipt, independent of Python decoding.
+    static ros::Publisher raw_pub=nh.advertise<std_msgs::Float64MultiArray>("/drone/latency/lidar_transport",50);
+    static ros::Subscriber raw_sub;
+    using Event=ros::MessageEvent<sensor_msgs::PointCloud const>;
+    ros::SubscribeOptions raw_options;
+    raw_options.initByFullCallbackType<const Event&>("/drone/sim/lidar/points",1,
+      [](const Event& e){
+        auto m=e.getMessage();std_msgs::Float64MultiArray t;
+        t.data={m->header.stamp.toSec(),e.getReceiptTime().toSec(),ros::Time::now().toSec(),timingMark().wall,double(m->points.size())};
+        raw_pub.publish(t);
+      });
+    raw_sub=nh.subscribe(raw_options);
+  }
   pub_translation_observability_ = nh.advertise<std_msgs::Float64MultiArray>("/faster_lio/translation_observability", 10);
   pub_laser_cloud_world_ =
     nh.advertise<sensor_msgs::PointCloud2>("/cloud_registered", 100000);
@@ -353,8 +385,11 @@ void LaserMapping::Run()
     return;
   }
 
+  const auto run_start=latency_enabled_?timingMark():TimingMark{};
+  if(latency_enabled_) {active_timing_.values[11]=run_start.wall;active_timing_.values[12]=ros::Time::now().toSec();}
   /// IMU process, kf prediction, undistortion
   p_imu_->Process(measures_, kf_, scan_undistort_);
+  if(latency_enabled_)recordStage(active_timing_.values,17,run_start);
   if(scan_undistort_->empty() || (scan_undistort_ == nullptr))
   {
     LOG(WARNING) << "No point, skip this scan!";
@@ -373,12 +408,14 @@ void LaserMapping::Run()
     (measures_.lidar_bag_time_ - first_lidar_time_) >= options::INIT_TIME;
 
   /// downsample
+  const auto down_start=latency_enabled_?timingMark():TimingMark{};
   Timer::Evaluate(
     [&, this]() {
       voxel_scan_.setInputCloud(scan_undistort_);
       voxel_scan_.filter(*scan_down_body_);
     },
     "Downsample PointCloud");
+  if(latency_enabled_)recordStage(active_timing_.values,20,down_start);
 
   int cur_pts = scan_down_body_->size();
   if(cur_pts < 5)
@@ -394,6 +431,7 @@ void LaserMapping::Run()
   plane_coef_.resize(cur_pts, common::V4F::Zero());
 
   // ICP and iterated Kalman filter update
+  const auto solve_start=latency_enabled_?timingMark():TimingMark{};
   Timer::Evaluate(
     [&, this]() {
       // iterated state estimation
@@ -409,9 +447,13 @@ void LaserMapping::Run()
         state_point_.pos + state_point_.rot * state_point_.offset_T_L_I;
     },
     "IEKF Solve and Update");
+  if(latency_enabled_)recordStage(active_timing_.values,23,solve_start);
 
   // update local map
+  const auto map_start=latency_enabled_?timingMark():TimingMark{};
   Timer::Evaluate([&, this]() { MapIncremental(); }, "    Incremental Mapping");
+  if(latency_enabled_)recordStage(active_timing_.values,26,map_start);
+  const auto output_start=latency_enabled_?timingMark():TimingMark{};
 
   // Per-scan logging at 10 Hz adds avoidable terminal and disk load during
   // SITL, especially while EGO is optimizing.  One sample per second keeps
@@ -457,27 +499,44 @@ void LaserMapping::Run()
     }
   }
 
+  if(latency_enabled_ && !run_in_offline_) {
+    recordStage(active_timing_.values,35,output_start);
+    const auto end=timingMark();auto& v=active_timing_.values;
+    v[32]=end.wall;v[33]=end.process-run_start.process;v[34]=end.thread-run_start.thread;
+    v[38]=scan_undistort_->size();v[39]=cur_pts;
+    std_msgs::Float64MultiArray m;m.data.assign(v.begin(),v.end());pub_latency_timing_.publish(m);
+  }
   // Debug variables
   frame_num_++;
 }
 
 void LaserMapping::StandardPCLCallBack(
-  const sensor_msgs::PointCloud2::ConstPtr &msg)
+  const sensor_msgs::PointCloud2::ConstPtr &msg, double receipt_sim)
 {
+  const auto callback=latency_enabled_?timingMark():TimingMark{};
+  const double callback_sim=latency_enabled_?ros::Time::now().toSec():0;
   mtx_buffer_.lock();
+  const auto preprocess_start=latency_enabled_?timingMark():TimingMark{};
   Timer::Evaluate(
     [&, this]() {
       scan_count_++;
       if(msg->header.stamp.toSec() < last_timestamp_lidar_)
       {
         LOG(ERROR) << "lidar loop back, clear buffer";
-        lidar_buffer_.clear();
+        lidar_buffer_.clear();timing_buffer_.clear();
       }
 
       PointCloudType::Ptr ptr(new PointCloudType());
       preprocess_->Process(msg, ptr);
       lidar_buffer_.push_back(ptr);
       time_buffer_.push_back(msg->header.stamp.toSec());
+      if(latency_enabled_) {
+        ScanTiming t;t.values[0]=msg->header.stamp.toSec();t.values[2]=receipt_sim;
+        t.values[3]=callback_sim;t.values[4]=callback.wall;t.values[5]=timingMark().wall;
+        recordStage(t.values,6,preprocess_start);t.values[13]=lidar_buffer_.size();
+        t.values[40]=preprocess_start.wall;t.values[41]=preprocess_start.wall-callback.wall;
+        timing_buffer_.push_back(t);
+      }
       last_timestamp_lidar_ = msg->header.stamp.toSec();
     },
     "Preprocess (Standard)");
@@ -485,16 +544,19 @@ void LaserMapping::StandardPCLCallBack(
 }
 
 void LaserMapping::LivoxPCLCallBack(
-  const livox_ros_driver2::CustomMsg::ConstPtr &msg)
+  const livox_ros_driver2::CustomMsg::ConstPtr &msg, double receipt_sim)
 {
+  const auto callback=latency_enabled_?timingMark():TimingMark{};
+  const double callback_sim=latency_enabled_?ros::Time::now().toSec():0;
   mtx_buffer_.lock();
+  const auto preprocess_start=latency_enabled_?timingMark():TimingMark{};
   Timer::Evaluate(
     [&, this]() {
       scan_count_++;
       if(msg->header.stamp.toSec() < last_timestamp_lidar_)
       {
         LOG(WARNING) << "lidar loop back, clear buffer";
-        lidar_buffer_.clear();
+        lidar_buffer_.clear();timing_buffer_.clear();
       }
 
       last_timestamp_lidar_ = msg->header.stamp.toSec();
@@ -523,6 +585,13 @@ void LaserMapping::LivoxPCLCallBack(
       preprocess_->Process(msg, ptr);
       lidar_buffer_.emplace_back(ptr);
       time_buffer_.emplace_back(last_timestamp_lidar_);
+      if(latency_enabled_) {
+        ScanTiming t;t.values[0]=msg->header.stamp.toSec();t.values[2]=receipt_sim;
+        t.values[3]=callback_sim;t.values[4]=callback.wall;t.values[5]=timingMark().wall;
+        recordStage(t.values,6,preprocess_start);t.values[13]=lidar_buffer_.size();
+        t.values[40]=preprocess_start.wall;t.values[41]=preprocess_start.wall-callback.wall;
+        timing_buffer_.push_back(t);
+      }
     },
     "Preprocess (Livox)");
 
@@ -566,6 +635,9 @@ bool LaserMapping::SyncPackages()
   {
     measures_.lidar_          = lidar_buffer_.front();
     measures_.lidar_bag_time_ = time_buffer_.front();
+    if(latency_enabled_ && !timing_buffer_.empty()) {
+      active_timing_=timing_buffer_.front();active_timing_.values[9]=timingMark().wall;
+    }
 
     if(measures_.lidar_->points.size() <= 1)
     {
@@ -590,11 +662,16 @@ bool LaserMapping::SyncPackages()
     }
 
     measures_.lidar_end_time_ = lidar_end_time_;
+    if(latency_enabled_) {
+      active_timing_.values[1]=lidar_end_time_;
+      active_timing_.values[15]=std::max(0.,lidar_end_time_-last_timestamp_imu_);
+    }
     lidar_pushed_             = true;
   }
 
   if(last_timestamp_imu_ < lidar_end_time_)
   {
+    if(latency_enabled_ && active_timing_.values[10]==0)active_timing_.values[10]=timingMark().wall;
     return false;
   }
 
@@ -610,6 +687,10 @@ bool LaserMapping::SyncPackages()
     imu_buffer_.pop_front();
   }
 
+  if(latency_enabled_) {
+    active_timing_.values[14]=lidar_buffer_.size();active_timing_.values[16]=imu_buffer_.size();
+    if(!timing_buffer_.empty())timing_buffer_.pop_front();
+  }
   lidar_buffer_.pop_front();
   time_buffer_.pop_front();
   lidar_pushed_ = false;
@@ -890,7 +971,9 @@ void LaserMapping::PublishOdometry(const ros::Publisher &pub_odom_aft_mapped)
   // Keep the estimator covariance separate from the geometry diagnostic.
   // The bridge applies timed warning/HOLD/landing protection to that diagnostic;
   // a single weak scan must not masquerade as a permanent numerical failure.
+  if(latency_enabled_) {active_timing_.values[29]=timingMark().wall;active_timing_.values[30]=ros::Time::now().toSec();}
   pub_odom_aft_mapped.publish(odom_aft_mapped_);
+  if(latency_enabled_)active_timing_.values[31]=timingMark().wall;
   std_msgs::Float64MultiArray diagnostic;
   diagnostic.data={lidar_end_time_,translation_observability_.strengths(0),
                    translation_observability_.strengths(1),translation_observability_.strengths(2),

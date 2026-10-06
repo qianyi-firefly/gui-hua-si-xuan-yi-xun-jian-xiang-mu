@@ -7,6 +7,7 @@ import copy
 import json
 import math
 import threading
+import time
 from collections import deque
 
 import numpy as np
@@ -41,8 +42,8 @@ class LioBridge:
         self.geometry_low = False
         self.geometry_quality = 'UNKNOWN'
         self.geometry_min_support = rospy.get_param('/mapping/min_translation_support', 50.0)
-        self.geometry_hold_s = rospy.get_param('~geometry_hold_s', 0.5)
-        self.geometry_land_s = rospy.get_param('~geometry_land_s', 1.0)
+        self.geometry_hold_s = rospy.get_param('~geometry_hold_s', rospy.get_param('/drone/health_hold_s',1.0))
+        self.geometry_land_s = rospy.get_param('~geometry_land_s', rospy.get_param('/drone/health_land_s',2.0))
         self.geometry_recovery_s = rospy.get_param('~geometry_recovery_s', 0.5)
         if not (all(math.isfinite(v) for v in (self.geometry_min_support, self.geometry_hold_s,
                                               self.geometry_land_s, self.geometry_recovery_s)) and
@@ -66,8 +67,15 @@ class LioBridge:
         self.cloud_pub = rospy.Publisher('/drone/cloud_world', PointCloud2, queue_size=2)
         self.cloud_pose_pub = rospy.Publisher('/drone/cloud_body_pose', PoseStamped, queue_size=2)
         self.fcu_cloud_pub = rospy.Publisher('/drone/cloud_fcu_world', PointCloud2, queue_size=2)
+        self.mapping_cloud_pub = rospy.Publisher('/drone/mapping/rays', PointCloud2, queue_size=1)
+        self.mapping_rays = deque(maxlen=8)
+        rospy.Subscriber('/drone/sim/lidar/mapping_rays', PointCloud2,
+                         lambda m: self.mapping_rays.append(m), queue_size=1)
         self.fcu_odom_pub = rospy.Publisher('/drone/fcu/odom', Odometry, queue_size=10)
         self.valid_pub = rospy.Publisher('/drone/lio/valid', Bool, queue_size=1, latch=True)
+        self.latency_enabled=rospy.get_param('/drone/record_lio_latency',False)
+        self.latency_pub=rospy.Publisher('/drone/latency/lio_bridge',Float64MultiArray,queue_size=50) if self.latency_enabled else None
+        self.latency_output=None
         self.health_pub = rospy.Publisher('/drone/lio/health', String, queue_size=1, latch=True)
         self.quality_pub = rospy.Publisher('/drone/lio/quality', String, queue_size=1, latch=True)
         rospy.Subscriber('/faster_lio/translation_observability', Float64MultiArray,
@@ -156,8 +164,18 @@ class LioBridge:
             self.valid_pub.publish(Bool(data=valid))
 
     def on_odom(self, msg):
+        received=time.monotonic() if self.latency_enabled else 0.
+        cpu=time.thread_time() if self.latency_enabled else 0.
+        received_sim=rospy.Time.now().to_sec() if self.latency_enabled else 0.
         with self.lock:
+            acquired=time.monotonic() if self.latency_enabled else 0.
+            previous=self.last_stamp
             self.process_odom(msg)
+            if self.latency_enabled:
+                published=self.last_stamp>previous
+                output=self.latency_output if published else (0.,0.)
+                self.latency_pub.publish(Float64MultiArray(data=[msg.header.stamp.to_sec(),received_sim,received,
+                    acquired,output[0],output[1],time.monotonic(),time.thread_time()-cpu,float(published)]))
 
     def process_odom(self, msg):
         self.update_geometry_quality(rospy.Time.now())
@@ -219,6 +237,7 @@ class LioBridge:
             out.twist.covariance[i * 7] = 1e6
         self.last_stamp = stamp
         self.lio_poses.append((stamp, base_pose))
+        if self.latency_enabled:self.latency_output=(time.monotonic(),rospy.Time.now().to_sec())
         self.odom_pub.publish(out)
         self.mavros_pub.publish(out)
         transform = TransformStamped()
@@ -331,7 +350,27 @@ class LioBridge:
         q = quaternion_from_matrix(fcu_pose)
         cloud_pose.pose.orientation.x, cloud_pose.pose.orientation.y, cloud_pose.pose.orientation.z, cloud_pose.pose.orientation.w = q
         self.cloud_pose_pub.publish(cloud_pose)
-        self.fcu_cloud_pub.publish(self.transform_cloud(out, fcu_from_lio, 'odom'))
+        registered = self.transform_cloud(out, fcu_from_lio, 'odom')
+        self.fcu_cloud_pub.publish(registered)
+        candidates = tuple(self.mapping_rays)
+        rays = min(candidates, key=lambda m: abs((m.header.stamp-msg.header.stamp).to_nsec())) if candidates else None
+        if rays is not None and abs((rays.header.stamp-msg.header.stamp).to_nsec()) <= 15000000:
+            # Same acquisition pose as the display/registered cloud. This ray
+            # stream is mapping-only; it never enters Faster-LIO or EKF.
+            mapping = self.transform_cloud(rays, concatenate_matrices(fcu_pose,self.base_sensor), 'odom')
+            mapping.header.stamp = msg.header.stamp
+        else:
+            # Hardware/absence of explicit beams: valid returns only, no invented misses.
+            fields = {f.name:f for f in registered.fields}
+            endian='>' if registered.is_bigendian else '<'
+            dtype=np.dtype({'names':['x','y','z'], 'formats':[endian+('f4' if fields[n].datatype==PointField.FLOAT32 else 'f8') for n in ['x','y','z']],
+                            'offsets':[fields[n].offset for n in ['x','y','z']], 'itemsize':registered.point_step})
+            values=np.ndarray((registered.height,registered.width),dtype=dtype,buffer=registered.data,strides=(registered.row_step,registered.point_step))
+            points=np.ones((registered.width*registered.height,4),dtype=np.float32)
+            for i,n in enumerate(['x','y','z']):points[:,i]=values[n].reshape(-1)
+            mapping=PointCloud2(header=registered.header,height=1,width=len(points),point_step=16,row_step=16*len(points),is_dense=registered.is_dense,data=points.tobytes())
+            mapping.fields=[PointField(name=n,offset=4*i,datatype=PointField.FLOAT32,count=1) for i,n in enumerate(['x','y','z','intensity'])]
+        self.mapping_cloud_pub.publish(mapping)
 
 
 if __name__ == '__main__':

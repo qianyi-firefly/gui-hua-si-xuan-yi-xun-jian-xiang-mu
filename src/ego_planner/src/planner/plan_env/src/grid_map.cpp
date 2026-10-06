@@ -24,6 +24,12 @@ void GridMap::initMap(ros::NodeHandle &nh)
   node_.param("grid_map/obstacles_inflation", mp_.obstacles_inflation_, -1.0);
   node_.param("grid_map/obstacles_inflation_z", mp_.obstacles_inflation_z_, 0.1);
   node_.param("grid_map/retain_cloud_obstacles", mp_.retain_cloud_obstacles_, false);
+  std::vector<double> free_min,free_max;
+  node_.param("/drone_flight_manager/goal_min_xyz",free_min,std::vector<double>{-8.,-8.,.5});
+  node_.param("/drone_flight_manager/goal_max_xyz",free_max,std::vector<double>{8.,8.,2.5});
+  if(free_min.size()!=3 || free_max.size()!=3)throw std::runtime_error("Invalid navigation free evidence bounds");
+  mp_.free_evidence_min_=Eigen::Vector3d(free_min[0],free_min[1],free_min[2]);
+  mp_.free_evidence_max_=Eigen::Vector3d(free_max[0],free_max[1],free_max[2]);
   string cloud_memory_start_topic;
   node_.param("grid_map/cloud_memory_start_topic", cloud_memory_start_topic, string(""));
   cloud_memory_started_ = cloud_memory_start_topic.empty();
@@ -68,6 +74,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
           for (int x = 0; x < mp_.map_voxel_num_(0); ++x)
             for (int y = 0; y < mp_.map_voxel_num_(1); ++y) {
               const int address = toAddress(Eigen::Vector3i(x, y, old_ceiling));
+              dirty_voxels_.insert(address);
               md_.occupancy_buffer_inflate_[address] = md_.cloud_inflate_refs_[address] > 0;
             }
         mp_.virtual_ceil_height_ = message->data;
@@ -186,6 +193,8 @@ void GridMap::initMap(ros::NodeHandle &nh)
   map_inf_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate", 1, true);
   map_inf_safety_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/occupancy_inflate_safety", 1, true);
 
+  voxel_delta_pub_ = node_.advertise<plan_env::VoxelUpdate>("/grid_map/voxel_delta",100);
+  voxel_snapshot_service_ = node_.advertiseService("/grid_map/get_voxel_snapshot",&GridMap::voxelSnapshotCallback,this);
   observed_free_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/observed_free", 1, true);
   unknown_pub_ = node_.advertise<sensor_msgs::PointCloud2>("/grid_map/unknown", 10);
 
@@ -224,6 +233,7 @@ void GridMap::initMap(ros::NodeHandle &nh)
 void GridMap::resetBuffer()
 {
   navigation_cells_.clear();
+  dirty_voxels_.clear();voxel_full_pending_=true;voxel_stamp_=ros::Time(0);
   Eigen::Vector3d min_pos = mp_.map_min_boundary_;
   Eigen::Vector3d max_pos = mp_.map_max_boundary_;
 
@@ -250,6 +260,7 @@ void GridMap::resetBuffer(Eigen::Vector3d min_pos, Eigen::Vector3d max_pos)
     for (int y = min_id(1); y <= max_id(1); ++y)
       for (int z = min_id(2); z <= max_id(2); ++z)
       {
+        if(!voxel_full_pending_)dirty_voxels_.insert(toAddress(x,y,z));
         navigation_cells_.erase(toAddress(x,y,z));
         md_.occupancy_buffer_inflate_[toAddress(x, y, z)] = 0;
         md_.cloud_observed_free_[toAddress(x, y, z)] = 0;
@@ -725,7 +736,11 @@ void GridMap::addVirtualCeiling()
     return;
   for (int x = md_.local_bound_min_(0); x <= md_.local_bound_max_(0); ++x)
     for (int y = md_.local_bound_min_(1); y <= md_.local_bound_max_(1); ++y)
-      md_.occupancy_buffer_inflate_[toAddress(Eigen::Vector3i(x, y, ceil_id))] = 1;
+      {
+        const int address=toAddress(Eigen::Vector3i(x,y,ceil_id));
+        if(!md_.occupancy_buffer_inflate_[address])dirty_voxels_.insert(address);
+        md_.occupancy_buffer_inflate_[address]=1;
+      }
 }
 
 void GridMap::visCallback(const ros::TimerEvent & /*event*/)
@@ -736,6 +751,7 @@ void GridMap::visCallback(const ros::TimerEvent & /*event*/)
   if (md_.last_observation_stamp_.isZero() ||
       md_.last_observation_stamp_ == md_.last_published_stamp_)
     return;
+  publishVoxelDelta();
   publishMap();
   publishMapInflate(true);
   md_.last_published_stamp_ = md_.last_observation_stamp_;
@@ -869,7 +885,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
       img->header.stamp <= md_.last_observation_stamp_)
     return;
 
-  pcl::PointCloud<pcl::PointXYZ> latest_cloud;
+  pcl::PointCloud<pcl::PointXYZI> latest_cloud;
   pcl::fromROSMsg(*img, latest_cloud);
 
   if (!md_.has_odom_)
@@ -903,6 +919,11 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
   auto observe = [&](const Eigen::Vector3i& id, unsigned char flag) {
     if (!isInMap(id)) return;
     const int adr = toAddress(id);
+    // Keep free evidence only in the configurable execution volume. Rays
+    // still remove raw occupied cells outside it, preserving map clearing.
+    Eigen::Vector3d center;indexToPos(id,center);
+    const bool usable=(center.array()>=mp_.free_evidence_min_.array()).all() && (center.array()<=mp_.free_evidence_max_.array()).all();
+    if(flag==2 && !usable && !md_.cloud_evidence_[adr] && !md_.cloud_scan_flags_[adr])return;
     if (!md_.cloud_scan_flags_[adr]) touched.push_back(adr);
     md_.cloud_scan_flags_[adr] |= flag;
   };
@@ -912,7 +933,7 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     Eigen::Vector3d end(point.x, point.y, point.z);
     if (!end.allFinite()) continue;
     Eigen::Vector3i id; posToIndex(end, id);
-    observe(id, 1);
+    if (point.intensity > .5f) observe(id, 1);
   }
   const Eigen::Vector3d origin = md_.camera_pos_ + md_.camera_q_ * mp_.cloud_sensor_offset_;
   RayCaster raycaster;
@@ -921,13 +942,31 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     if (!end.allFinite()) continue;
     const double length = (end-origin).norm();
     if (length <= 0 || length > 40.0) continue;
-    if (!raycaster.setInput(origin/mp_.resolution_, end/mp_.resolution_)) continue;
+    // Traverse from the sensor; stop at the grid boundary rather than spend
+    // time marching 40 m through unmapped sky. A max-range miss has no hit.
+    Eigen::Vector3d clipped = end;
+    if (!isInMap(end)) {
+      const Eigen::Vector3d direction = end-origin;
+      double fraction = 1.;
+      for(int axis=0;axis<3;++axis) {
+        if(direction[axis]>0) fraction=std::min(fraction,(mp_.map_max_boundary_[axis]-1e-5-origin[axis])/direction[axis]);
+        else if(direction[axis]<0) fraction=std::min(fraction,(mp_.map_min_boundary_[axis]+1e-5-origin[axis])/direction[axis]);
+      }
+      if(fraction<=0) continue;
+      clipped=origin+fraction*direction;
+    }
+    if (!raycaster.setInput(origin/mp_.resolution_, clipped/mp_.resolution_)) continue;
     Eigen::Vector3d ray;
     while (raycaster.step(ray)) {
       const Eigen::Vector3d center = (ray+Eigen::Vector3d::Constant(.5))*mp_.resolution_;
       // Preserve a small band around the return, avoiding surface erosion
       // from voxel quantisation. Never extend free rays behind a return.
-      if ((center-end).norm() <= 1.5*mp_.resolution_) continue;
+      Eigen::Vector3i hit_id,cell_id;
+      posToIndex(end,hit_id);posToIndex(center,cell_id);
+      // Only protect the actual hit voxel, not a 15 cm halo of historical
+      // voxels that otherwise can never be cleared near moved surfaces.
+      if (point.intensity > .5f && cell_id == hit_id) continue;
+      if ((center-origin).norm() < .45) continue;
       Eigen::Vector3i id; posToIndex(center, id);
       observe(id, 2);
     }
@@ -952,10 +991,17 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
     // 2-3 independent free scans remove it. Many rays in one scan cannot.
     const unsigned char next = (flags & 1) ? std::min(3, int(previous)+2) :
                               (previous ? previous-1 : 0);
+    const bool old_free=md_.cloud_observed_free_[adr];
     md_.cloud_evidence_[adr] = next;
     navigation_cells_.insert(adr);
     if (flags & 1) md_.cloud_observed_free_[adr] = 0;
-    else md_.cloud_observed_free_[adr] = 1;
+    else {
+      Eigen::Vector3i id(adr/(mp_.map_voxel_num_(1)*mp_.map_voxel_num_(2)),(adr/mp_.map_voxel_num_(2))%mp_.map_voxel_num_(1),adr%mp_.map_voxel_num_(2));
+      Eigen::Vector3d center;indexToPos(id,center);
+      md_.cloud_observed_free_[adr]=(center.array()>=mp_.free_evidence_min_.array()).all() && (center.array()<=mp_.free_evidence_max_.array()).all();
+      if(!next && !md_.cloud_observed_free_[adr] && !md_.cloud_inflate_refs_[adr])navigation_cells_.erase(adr);
+    }
+    if(old_free!=bool(md_.cloud_observed_free_[adr]))dirty_voxels_.insert(adr);
     if (bool(previous) == bool(next)) continue;
     const int z0 = adr % mp_.map_voxel_num_(2);
     const int y0 = (adr/mp_.map_voxel_num_(2)) % mp_.map_voxel_num_(1);
@@ -967,7 +1013,9 @@ void GridMap::cloudCallback(const sensor_msgs::PointCloud2ConstPtr &img)
           auto& count = md_.cloud_inflate_refs_[inflated];
           if (next) ++count;
           else if (count) --count;
+          const bool old_occupied=md_.occupancy_buffer_inflate_[inflated];
           md_.occupancy_buffer_inflate_[inflated] = count > 0;
+          if(old_occupied!=bool(md_.occupancy_buffer_inflate_[inflated]))dirty_voxels_.insert(inflated);
           if (count || md_.cloud_observed_free_[inflated]) navigation_cells_.insert(inflated);
           else navigation_cells_.erase(inflated);
         }
@@ -1054,12 +1102,62 @@ void GridMap::publishMap()
   map_pub_.publish(cloud_msg);
 }
 
+void GridMap::fillVoxelMetadata(plan_env::VoxelUpdate& m) const
+{
+  m.header.frame_id=mp_.frame_id_;m.header.stamp=voxel_stamp_;
+  m.epoch=voxel_epoch_;m.revision=voxel_revision_;
+  m.resolution=mp_.resolution_;
+  m.origin.x=mp_.map_origin_.x();m.origin.y=mp_.map_origin_.y();m.origin.z=mp_.map_origin_.z();
+  for(int i=0;i<3;++i)m.shape[i]=mp_.map_voxel_num_[i];
+}
+
+bool GridMap::voxelSnapshotCallback(plan_env::GetVoxelSnapshot::Request&,
+                                  plan_env::GetVoxelSnapshot::Response& response)
+{
+  response.success=!voxel_full_pending_ && !voxel_stamp_.isZero();
+  if(!response.success)return true;
+  fillVoxelMetadata(response.update);response.update.full=true;response.update.base_revision=0;
+  for(size_t id=0;id<published_occupied_.size();++id) {
+    if(published_occupied_[id])response.update.occupied_added.push_back(id);
+    if(published_free_[id])response.update.free_added.push_back(id);
+  }
+  return true;
+}
+
+void GridMap::publishVoxelDelta()
+{
+  if(md_.last_observation_stamp_.isZero())return;
+  plan_env::VoxelUpdate m;
+  const bool full=voxel_full_pending_ || published_occupied_.size()!=md_.occupancy_buffer_inflate_.size();
+  if(full) {
+    voxel_epoch_=ros::WallTime::now().toNSec();voxel_revision_=0;
+    published_occupied_.assign(md_.occupancy_buffer_inflate_.size(),0);
+    published_free_.assign(md_.occupancy_buffer_inflate_.size(),0);
+  }
+  m.base_revision=voxel_revision_;++voxel_revision_;
+  voxel_stamp_=md_.last_observation_stamp_;fillVoxelMetadata(m);m.full=full;
+  auto append=[&](size_t id) {
+    const bool occupied=md_.occupancy_buffer_inflate_[id];
+    const bool free=mp_.require_observed_free_ && md_.cloud_observed_free_[id] && !occupied;
+    if(occupied!=bool(published_occupied_[id]))(occupied?m.occupied_added:m.occupied_removed).push_back(id);
+    if(free!=bool(published_free_[id]))(free?m.free_added:m.free_removed).push_back(id);
+    published_occupied_[id]=occupied;published_free_[id]=free;
+  };
+  if(full)for(size_t id=0;id<published_occupied_.size();++id)append(id);
+  else for(const int id:dirty_voxels_)append(id);
+  dirty_voxels_.clear();voxel_full_pending_=false;
+  // Publish an empty delta too: acquisition freshness is separate from geometry.
+  voxel_delta_pub_.publish(m);
+}
+
 void GridMap::publishMapInflate(bool all_info)
 {
 
-  const bool publish_visual = true; // populate the latched snapshot
-  const bool publish_safety = true;
-  const bool publish_free = mp_.require_observed_free_;
+  const bool visual_due=last_visual_stamp_.isZero() ||
+    (md_.last_observation_stamp_-last_visual_stamp_).toSec()>=.25;
+  const bool publish_visual=map_inf_pub_.getNumSubscribers()>0 && visual_due;
+  const bool publish_safety=map_inf_safety_pub_.getNumSubscribers()>0;
+  const bool publish_free=mp_.require_observed_free_ && observed_free_pub_.getNumSubscribers()>0;
   if (!publish_visual && !publish_safety && !publish_free)
     return;
 
@@ -1124,8 +1222,9 @@ void GridMap::publishMapInflate(bool all_info)
   cloud.header.frame_id = mp_.frame_id_;
   sensor_msgs::PointCloud2 cloud_msg =
       plan_env::makeMapMessage(cloud, md_.last_observation_stamp_, mp_.frame_id_);
-  if (publish_visual)
-    map_inf_pub_.publish(cloud_msg);
+  if (publish_visual) {
+    map_inf_pub_.publish(cloud_msg);last_visual_stamp_=md_.last_observation_stamp_;
+  }
   if (publish_safety)
   {
     safety_cloud.width = safety_cloud.points.size();
@@ -1249,7 +1348,7 @@ void GridMap::rebuildCloudInflation()
 {
   std::fill(md_.cloud_inflate_refs_.begin(),md_.cloud_inflate_refs_.end(),0);
   std::fill(md_.occupancy_buffer_inflate_.begin(),md_.occupancy_buffer_inflate_.end(),0);
-  navigation_cells_.clear();
+  navigation_cells_.clear();voxel_full_pending_=true;voxel_stamp_=ros::Time(0);
   const int xy=std::ceil(mp_.obstacles_inflation_/mp_.resolution_);
   const int zz=std::ceil(mp_.obstacles_inflation_z_/mp_.resolution_);
   for(size_t adr=0;adr<md_.cloud_evidence_.size();++adr) {
@@ -1298,9 +1397,14 @@ bool GridMap::mapArchiveCallback(plan_env::MapArchive::Request& req,plan_env::Ma
       std::filesystem::create_directories(path.parent_path());
       const auto temporary=req.path+".tmp";
       std::ofstream file(temporary,std::ios::trunc);
-      file << std::setprecision(17) << "DRONE_GRID_V1 " << mp_.frame_id_ << ' ' << mp_.resolution_ << ' '
+      file << std::setprecision(17) << (req.use_map_frame ? "DRONE_GRID_V2 " : "DRONE_GRID_V1 ") << mp_.frame_id_ << ' ' << mp_.resolution_ << ' '
            << mp_.map_origin_.x() << ' ' << mp_.map_origin_.y() << ' ' << mp_.map_origin_.z() << ' '
-           << mp_.map_voxel_num_.x() << ' ' << mp_.map_voxel_num_.y() << ' ' << mp_.map_voxel_num_.z() << ' ' << records.size() << '\n';
+           << mp_.map_voxel_num_.x() << ' ' << mp_.map_voxel_num_.y() << ' ' << mp_.map_voxel_num_.z() << ' ' << records.size();
+      if(req.use_map_frame) {
+        if(!std::isfinite(req.offset_x)||!std::isfinite(req.offset_y)||!std::isfinite(req.offset_z)||!std::isfinite(req.yaw_deg))throw std::runtime_error("保存地图坐标变换无效");
+        file << ' ' << req.offset_x << ' ' << req.offset_y << ' ' << req.offset_z << ' ' << req.yaw_deg;
+      }
+      file << '\n';
       for(const auto& r:records)file << r.address << ' ' << r.evidence << ' ' << r.free << '\n';
       file.flush();if(!file)throw std::runtime_error("地图写入失败");file.close();
       std::filesystem::rename(temporary,path);
@@ -1311,29 +1415,45 @@ bool GridMap::mapArchiveCallback(plan_env::MapArchive::Request& req,plan_env::Ma
     if(std::abs(req.offset_x)>30. || std::abs(req.offset_y)>30. || std::abs(req.offset_z)>5. || std::abs(req.yaw_deg)>180.)return fail("地图变换超过允许范围");
     if(std::filesystem::file_size(path)>256*1024*1024) return fail("地图文件超出大小限制");
     std::ifstream file(path);std::string magic,frame;double resolution,ox,oy,oz;int nx,ny,nz;size_t count;
-    if(!(file>>magic>>frame>>resolution>>ox>>oy>>oz>>nx>>ny>>nz>>count) || magic!="DRONE_GRID_V1" || frame!=mp_.frame_id_ || !std::isfinite(resolution)||!std::isfinite(ox)||!std::isfinite(oy)||!std::isfinite(oz) || std::abs(resolution-mp_.resolution_)>1e-9 || (Eigen::Vector3d(ox,oy,oz)-mp_.map_origin_).norm()>1e-8 || nx!=mp_.map_voxel_num_.x() || ny!=mp_.map_voxel_num_.y() || nz!=mp_.map_voxel_num_.z() || count>md_.cloud_evidence_.size())return fail("地图版本、坐标系、分辨率或网格尺寸不兼容");
+    if(!(file>>magic>>frame>>resolution>>ox>>oy>>oz>>nx>>ny>>nz>>count) || (magic!="DRONE_GRID_V1" && magic!="DRONE_GRID_V2") || frame!=mp_.frame_id_ || !std::isfinite(resolution)||!std::isfinite(ox)||!std::isfinite(oy)||!std::isfinite(oz) || std::abs(resolution-mp_.resolution_)>1e-9 || (Eigen::Vector3d(ox,oy,oz)-mp_.map_origin_).norm()>1e-8 || nx!=mp_.map_voxel_num_.x() || ny!=mp_.map_voxel_num_.y() || nz!=mp_.map_voxel_num_.z() || count>md_.cloud_evidence_.size())return fail("地图版本、坐标系、分辨率或网格尺寸不兼容");
     struct Record {int address,evidence,free;};std::vector<Record> records;records.reserve(count);
     std::unordered_set<int> source_addresses;
-    const double yaw=req.yaw_deg*std::acos(-1.)/180.;
+    double saved_x=0,saved_y=0,saved_z=0,saved_yaw=0;
+    if(magic=="DRONE_GRID_V2" && (!(file>>saved_x>>saved_y>>saved_z>>saved_yaw) || !std::isfinite(saved_x)||!std::isfinite(saved_y)||!std::isfinite(saved_z)||!std::isfinite(saved_yaw)))return fail("地图坐标元数据无效");
+    const double yaw=(req.yaw_deg+(req.use_map_frame?saved_yaw:0.))*std::acos(-1.)/180.;
     Eigen::Matrix3d rotation=Eigen::AngleAxisd(yaw,Eigen::Vector3d::UnitZ()).toRotationMatrix();
     Eigen::Vector3d offset(req.offset_x,req.offset_y,req.offset_z);
+    if(req.use_map_frame)offset+=Eigen::AngleAxisd(req.yaw_deg*std::acos(-1.)/180.,Eigen::Vector3d::UnitZ()).toRotationMatrix()*Eigen::Vector3d(saved_x,saved_y,saved_z);
     // Rotated/partially shifted free voxels do not prove an entire destination
     // voxel free. Import free evidence only for zero yaw and grid-aligned shifts.
-    const bool free_aligned=std::abs(std::remainder(req.yaw_deg,360.))<1e-8 &&
+    const bool free_aligned=std::abs(std::remainder(yaw,2*std::acos(-1.)))<1e-8 &&
       ((offset/mp_.resolution_).array()-(offset/mp_.resolution_).array().round()).matrix().norm()<1e-8;
     for(size_t n=0;n<count;++n) {
       int id,e,f;if(!(file>>id>>e>>f)||id<0||size_t(id)>=md_.cloud_evidence_.size()||e<0||e>3||f<0||f>1||(!e&&!f)||(e&&f)||!source_addresses.insert(id).second)return fail("地图体素数据无效或重复");
       Eigen::Vector3i old(id/(ny*nz),(id/nz)%ny,id%nz),dest;Eigen::Vector3d position;indexToPos(old,position);position=rotation*position+offset;posToIndex(position,dest);
-      if(!isInMap(dest))return fail("地图对齐后有体素超出网格，加载已拒绝");
+      if(!isInMap(dest) && !req.clip_to_navigation_grid)return fail("地图对齐后有体素超出网格，加载已拒绝");
       if(e && !free_aligned) {
         // Rasterize the transformed source voxel box conservatively. A rotated
         // voxel is not just a point: preserve every possibly occupied cell.
         const Eigen::Vector3d half=rotation.cwiseAbs()*Eigen::Vector3d::Constant(mp_.resolution_*.5);
         Eigen::Vector3i low,high;posToIndex(position-half+Eigen::Vector3d::Constant(1e-9),low);posToIndex(position+half-Eigen::Vector3d::Constant(1e-9),high);
+        // A valid boundary voxel can extend below the navigation grid after
+        // a small vertical origin change. Clip only its below-floor portion;
+        // its centre must still be in the grid (checked above). Keep rejecting
+        // horizontal/top overflow so an invalid alignment cannot lose walls.
+        if(req.clip_to_navigation_grid) {
+          // Simulation spawn may move the local grid relative to the prior.
+          // Intersect voxel boxes with this grid; the flight volume is strictly
+          // contained inside it, so no navigable-space obstacle is discarded.
+          low=low.cwiseMax(Eigen::Vector3i::Zero());
+          high=high.cwiseMin(mp_.map_voxel_num_-Eigen::Vector3i::Ones());
+          if((low.array()>high.array()).any())continue;
+        }
+        low.z()=std::max(0,low.z());
         if(!isInMap(low)||!isInMap(high))return fail("旋转地图边界超出网格");
         for(int x=low.x();x<=high.x();++x)for(int y=low.y();y<=high.y();++y)for(int z=low.z();z<=high.z();++z)
           records.push_back({toAddress(x,y,z),e,0});
-      } else records.push_back({toAddress(dest),e,free_aligned?f:0});
+      } else if(isInMap(dest))records.push_back({toAddress(dest),e,free_aligned?f:0});
     }
     std::string trailing;if(file>>trailing)return fail("地图包含多余数据");
     if(records.empty())return fail("地图为空");
@@ -1351,6 +1471,7 @@ bool GridMap::mapArchiveCallback(plan_env::MapArchive::Request& req,plan_env::Ma
     }
     rebuildCloudInflation();archive_mode_="PRIOR_NAV";res.mode=archive_mode_;res.success=true;
     res.message="已加载预建地图导航："+req.path+"；实时雷达继续确认/清除占据";
+    if(req.clip_to_navigation_grid)res.message+="；仅加载当前导航网格覆盖部分";
     if(!free_aligned)res.message+="；非网格对齐变换，历史自由空间未导入，等待实时观测";
     publishArchiveMode(res.message);return true;
   }catch(const std::exception& e){return fail(std::string("地图操作失败：")+e.what());}

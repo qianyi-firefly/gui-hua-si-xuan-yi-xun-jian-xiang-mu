@@ -7,6 +7,7 @@
 #include <ros/ros.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <condition_variable>
+#include <array>
 #include <thread>
 
 #include "imu_processing.hpp"
@@ -48,8 +49,8 @@ public:
   void Run();
 
   // callbacks of lidar and imu
-  void StandardPCLCallBack(const sensor_msgs::PointCloud2::ConstPtr &msg);
-  void LivoxPCLCallBack(const livox_ros_driver2::CustomMsg::ConstPtr &msg);
+  void StandardPCLCallBack(const sensor_msgs::PointCloud2::ConstPtr &msg, double receipt_sim=-1);
+  void LivoxPCLCallBack(const livox_ros_driver2::CustomMsg::ConstPtr &msg, double receipt_sim=-1);
   void IMUCallBack(const sensor_msgs::Imu::ConstPtr &msg_in);
 
   // sync lidar with imu
@@ -104,6 +105,11 @@ private:
   double min_translation_support_ = 0.0;
   TranslationObservability translation_observability_;
   ros::Publisher pub_translation_observability_;
+  ros::Publisher pub_latency_timing_;
+  bool latency_enabled_=false;
+  struct ScanTiming { std::array<double,42> values{}; };
+  std::deque<ScanTiming> timing_buffer_;
+  ScanTiming active_timing_;
 
   /// params
   std::vector<double> extrinT_{ 3, 0.0 };  // lidar-imu translation

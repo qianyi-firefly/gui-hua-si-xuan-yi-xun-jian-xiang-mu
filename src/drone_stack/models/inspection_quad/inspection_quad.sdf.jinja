@@ -218,13 +218,6 @@
             <resolution>0.02</resolution>
           </range>
         </ray>
-        <plugin name="mid360_ros_cloud" filename="libgazebo_ros_block_laser.so">
-          <robotNamespace>/</robotNamespace>
-          <alwaysOn>true</alwaysOn>
-          <updateRate>10</updateRate>
-          <topicName>/drone/sim/lidar/points</topicName>
-          <frameName>lidar</frameName>
-        </plugin>
       </sensor>
       <sensor name="mid360_imu" type="imu">
         <pose>0.27 0 0.10 0 0.5235987756 0</pose>

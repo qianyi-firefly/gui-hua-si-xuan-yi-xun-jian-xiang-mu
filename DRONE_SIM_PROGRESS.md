@@ -1,3 +1,96 @@
+## 2026-10-06 原生C++雷达前端已部署；用户选择1s HOLD/2s降落，estimator_age保持
+
+- 用户纠正不改estimator_age，并明确选择持续2秒降落、1秒先HOLD、严重立即降落；管理器/bridge/launch统一1/2，estimator_age仍2秒，EGO心跳1秒。健康边界表达式测试及运行参数核对通过。
+- sim_livox_native_adapter.cpp直接原生Gazebo LaserScanStamped.Time，C++构造CustomMsg+真实hit/miss映射射线和IMU转发，旧ROS block-laser插件从generate_model.py删除（仅改生成模板会被该脚本写回，已修）；设备几何/传感器参数/ENU/pose-only保持。当前SDK流不使用world_pose/真值。
+- 启动出现Qt/Gazebo OGRE1.9崩溃，core空指针来自无物理显示器的RandR模式列表；workspace兼容lib及启动器条件启用处理，GPU与系统显示配置保持。完整编译和最终原生目标构建退出0；Qt和Gazebo后台现已稳定。
+- 部署/实验start/qt_work/native_lidar_final_20261006_181818（两个current别名），日志start/logs/native_lidar_final_20261006_181818。地面验证README/报告native_frontend_deployment_report.md：299帧前端构造0.525ms、位姿年龄22ms sim/p95 30/max46，前端进程约4.1%单核；格式9061点/100ms offset正确，mapping4531hit+5540miss，融合EV11/GPS0/BARO0/HGT3。
+- 当前用户手动飞行进行中：20:46:56起飞，20:47:18导航；20:47:50在线目标被观测占据，单点跳过保留后续，20:47:51新点导航。近期位姿年龄中位28ms/p95 46/max60、健康HEALTHY；20:47:27局部前瞻碰撞等待不应称已完全无导航问题。没有自动飞行控制，记录未停止，新的飞行验收仍进行。
+- 当前进程：launcher=46011, monitor.py=47024, reference_observer.py=47025, heartbeat_observer.py=47026, resource_observer.py=47027, voxel_observer.py=47028, lio_latency_observer.py=47029, rosbag=47030, qt=46085, adapter=46106, lio=46107, bridge=46113, ego=46121, manager=46168, map_session=46170, global=46176, px4=46644, gzserver=46510. README更新，estimator_age原样；当前未提交/推送，GitHub仍11c9129。恢复用native_lidar_latest检查点及这些日志/进度；勿因当前飞行直接重启。
+
+## 2026-10-06 定位链路分段计时已部署，地面300帧测得前端瓶颈与源时间戳滞后
+
+- 新增全局可选/drone/record_lio_latency（DRONE_RECORD_LIO_TIMING=true）；C++雷达MessageEvent接收时刻、预处理/缓冲/等IMU/去畸变/降采样/IEKF/地图/位姿及点云发布的墙钟/进程CPU/主线程CPU；Python适配器接收/反序列化CPU和逐点转换/发布，桥接锁等待/处理；独立CPP原始雷达传输收包时刻。默认关闭，算法/队列/时间戳/融合不改。
+- 确认落地上锁后停止旧实验，计时完整编译两次退出0并重启。初步阶段发现诊断包起点/终点域错配，原始packet保留并用lio_latency_join.py按CPP BEGIN/END准确关联重建；最终四路探针完整关联。当前start/qt_work/lio_segment_timing_final_20261006_165403（两个current别名），startup sim70.190 READY/HEALTHY、MAPPING、unarmed/landed1，已有50完整健康帧。记录持续，未自动飞行。
+- sim65～95地面300帧：适配器回调前CPU50ms、构造90ms/发布8.4ms；LIO计算至位姿10.2ms（p95 20.7），缓冲等0.016ms、IMU等0、桥接锁0.010ms。LIO队列深度1；报告位姿年龄中位0.230sim秒。地面常态主要是雷达前端CPU/时间标签，不能替代旧飞行峰值分段结果。
+- 仿真点云头到CPP接收中位0.132sim秒。额外nativeLaser与ROSCloud同帧接收配对5帧：原生测量时间比ROS头新0.128～0.154sim秒。安装插件二进制LastUpdateTime→PutLaserData与官方Gazebo回调/lastUpdateTime更新顺序吻合，存在上一周期旧时间戳；不把全部差值叫纯固定100ms，不直接刷新/加常数伪造时间。源时间戳修复/C++前端替换尚未实施。
+- 报告lio_segment_timing_analysis.md、timing_schema.json、latency_ground_summary.json、native_lidar_timestamp_comparison.json及CSV/packet保存。下一步用户手动相近路线复现0.47s峰值；后台记录包含/Odometry、/mavros/odometry/out、/mavros/estimator_status和四路计时诊断；不录原始点云。当前进程：launcher=32066, monitor.py=33070, reference_observer.py=33071, heartbeat_observer.py=33072, resource_observer.py=33073, voxel_observer.py=33074, lio_latency_observer.py=33075, rosbag=33076, qt=32140, adapter=32161, lio=32162, bridge=32168, ego=32177, manager=32220, map_session=32221, global=32223, px4=32708, gzserver=32576.
+
+## 2026-10-06 EKF取消原始ULog根因已取证（只分析）
+
+- ULog08_11_51.ulg sim602.788 vision_data_stopped、EV位置/高度/航向停融，solution831→129；603.276恢复位置/高度，实际停融0.488s。ROS标志602.808无效→603.806有效，低频报告延长到近1s，603.368的0.5s健康保护取消任务发生在原始EKF恢复之后。
+- 对应定位样本在ROS诊断已老0.448～0.474s，PX4接收年龄0.445～0.473s。实际EKF延迟时域316ms；RingBuffer只接受该时域前100ms内样本，过旧数据无法及时融合，继而400ms EV融合样本超时。EKF2_DELAY_MAX=400配置值≠实测时域316ms；未归因到具体LIO函数。
+- filter_fault_flags0、IMU错误/削顶0、几何支持>500，外部速度融合关闭（EV_CTRL11/cs_ev_vel0）。报告start/qt_work/spline_cache_fixed_20261006_155431/ekf_health_protection_analysis.md及ekf_raw_incident_603.json保存原始窗口。建议减延迟、核对实际EKF时域、提高ESTIMATOR_STATUS5～10Hz；均未实施，未重启/发送控制。
+
+## 2026-10-06 SciPy样条只读缓存错误已修复部署，录制曲线回归通过
+
+- 用户确认降落后再次读取FCU connected=true/armed=false/landed_state1。停止旧记录/运行，rosbag SIGINT完成索引；修复BSpline使用独立可写knots/points副本，缓存原始几何保持只读。纯Python改动无需C++编译；新launcher源快照与当前trajectory_guard.py逐字节一致，deployment.json保存SHA256。
+- 使用旧实验录制的27条真实Bspline回归：每条128采样位置、速度、加速度与未缓存BSpline逐项一致（最大差0）；确切出错的起点标量求值通过，validate_curve数值检查通过；32次4线程并发求值一致，27条derivative(1/2)对象求值也通过。结果spline_cache_fix_verification.json。这是数值回归，不是自动飞行或真实障碍绕行验收。
+- 新运行start/logs/spline_cache_fixed_20261006_155431，部署/记录start/qt_work/spline_cache_fixed_20261006_155431（current_feature_deployment/current_manual_observer）。sim65.190地面READY/HEALTHY、OFFBOARD未进入、FCU AUTO.LOITER/connected/armed=false/landed1、map MAPPING/alignment true，manager/global voxel有效且resync0。运行日志无新read-only/bad callback报错；没有ARM/起飞/目标指令。
+- 心跳1.0sim秒、增量地图/缓存与4Hz/15FPS显示保持；Qt已打开，heartbeat/resource/voxel/常规观察及轻量rosbag已开启。进程：launcher=18700, monitor.py=19695, reference_observer.py=19696, heartbeat_observer.py=19697, resource_observer.py=19698, voxel_observer.py=19699, rosbag=19700, qt=18777, ego=18808, manager=18857, map_session=18860, global=18863, px4=19338, gzserver=19211. 下一步用户手动复试飞行，观察on_spline及紫线/终点，不宣称其他飞行问题已全部验收。
+
+## 2026-10-06 飞行实验发现样条缓存只读兼容问题，源码修正待地面部署
+
+- 本轮当前NAVIGATING/SPACE_WAIT、FCU connected/armed/OFFBOARD、HEALTHY，仍保持等待位姿。15:50:17等on_spline回调ValueError buffer source array is read-only；不是本次心跳超时。新缓存BSpline别名引用了被setflags(write=False)的原始knots/points，安装SciPy的Cython求值接口要求可写缓冲，造成轨迹读数异常。
+- trajectory_guard.py已修正：BSpline使用独立knots.copy()/points.copy()可写数组，缓存原始几何仍只读。Python AST通过；当前飞行进程仍是旧内存代码，未重启、未发控制，不可宣称修复已部署/飞行验收。待确认落地未解锁再部署，复查样条求值、终点控制和轨迹显示。
+- 增量地图manager/global有效、无断序；当前CPU管理器约16%、Qt14%、EGO75%（飞行附近抽样）。记录继续于start/qt_work/cpu_optimized_20261006_154027。
+
+## 2026-10-06 CPU优化1/2/3与1秒心跳门槛已编译部署，地面只读核对完成
+
+- 按用户选择落实：新增plan_env/VoxelUpdate、GetVoxelSnapshot，/grid_map/voxel_delta每有效观测发布epoch/revision/base_revision、占据/自由增删ID；数据不变仍发小型空增量保留真实扫描采集时间。地图/原点初始化完成前仍清图发full；READY锁定地图帧后仅扫描dirty体素，reset/加载更换epoch。保留盲区与射线确认清除/膨胀引用逻辑。
+- 管理器/全局节点共用voxel_map_client.py，占据/自由同版本位图，在控制锁外解码、变更层copy-on-write，锁内原子交换。断序/格式错误先使本地地图时间失效再完整快照恢复，旧epoch/revision不覆盖新状态；地图时间不随缓存重放刷新。两端不再订阅安全/自由PointCloud2（readonly rostopic info确认Subscribers None）。后台兼容点云仅有订阅时生成；Qt占据体素4Hz，安全增量仍每扫描更新。
+- trajectory_guard缓存24组几何内容对应的BSpline/PPoly，manager和global复用；不缓存时间/地图/碰撞结论，保持每次检查当前输入。执行紫线显示刷新4Hz、RViz15FPS；默认只开Qt，Gazebo物理/传感器服务器仍运行，需要窗口用DRONE_SHOW_GAZEBO=1。
+- max_planner_age_s默认、允许上限和launch值改1.0sim秒，运行rosparam核对1.0。2秒轨迹墙钟预算等其余保护不变。新增显式online_mode，修复DRONE_PREBUILT_MAP空字符串被roslaunch回退地图默认值；本轮自动无图启动，无需点击online服务。
+- 编译完整catkin_make -j1 -l1退出0，Python AST/XML/bash -n/git diff --check通过。旧实验确认connected/unarmed/landed1后停止，rosbag用SIGINT完成索引（旧flight_diagnostics_0.bag约20MB）。新运行start/logs/cpu_optimized_20261006_154027，部署与观察start/qt_work/cpu_optimized_20261006_154027（两个current别名）。sim65.560 READY/HEALTHY、ONLINE/MAPPING、alignment true、FCU未解锁落地；启动JSON中客户端仍为冷启动full，后续已确认同一epoch连续递增增量。
+- sim75～95地面抽样196个增量，体素ID载荷平均546.8B、最大3236B（不含ROS消息头）；CPU单核百分比：管理器12.78、Qt13.53、EGO66.12、LIO25.93、Gazebo服务101.23。这与之前飞行/不同地点不是同条件对照，不应宣称确定降幅；ground_profile.json保存数字。
+- 增量接收与权威完整快照按同一epoch/revision680核对：occupied122264/free265306完全一致、无交集。第三只读晚接入客户端自然断序后通过服务成功恢复；正常manager/global未见断序。voxel_snapshot_consistency.json保存证据。未发送任何ARM/起飞/目标，缓存/增量飞行安全与效果仍需手动回归。
+- 当前进程：launcher=15344, monitor.py=16337, reference_observer.py=16338, heartbeat_observer.py=16339, resource_observer.py=16340, voxel_observer.py=16341, rosbag=16342, qt=15418, lio=15438, ego=15451, manager=15497, map_session=15499, global=15501, gzserver=15852, px4=15977. monitor/reference/heartbeat/resource/voxel观察和轻量rosbag持续运行，记录含voxel_delta；不录原始点云/大体素/视频。源码改动未提交/推送，GitHub仍为11c9129。README已补接口/启动/性能改动。
+
+## 2026-10-06 本轮心跳超时已取证分析（未修改）
+
+- sim137.276新规划ACK/enabled=true，137.582（差0.306s）触发心跳超时HOLD；首DataDisp直到137.672才发出（ACK后0.396s），137.718管理器接受（age0.046s），此前已取消。EGO有ACK_START及后续final_plan_success=1，不是死进程证据；故障窗口没有先收到首心跳却因future/stale拒绝的记录。
+- 超时附近整机CPU88.7～90.8%，8逻辑核load1约16.8～19.2，EGO约单核97～102%，计算压力与单线程回调共享均存在。直接机制是启动期未等首心跳就套0.3s门槛；未记录逐C++回调耗时，具体阻塞函数尚不能确定。整轮另有future拒绝，与本次首心跳迟发分开分析。
+- 分析报告start/qt_work/heartbeat_online_20261006_151124/ego_timeout_analysis.md。建议启动/运行心跳分阶段、独立心跳与规划进度、降低地图处理拥堵，时钟超前另修；均未实施。本轮监测/录包继续，未发送控制或重启。
+
+## 2026-10-06 无图在线实验重启就绪，心跳诊断与轻量录包持续记录
+
+- 按用户要求无地图重启，确认启动前无ROS/PX4/Gazebo旧进程。权限受限时的尝试因本机TCP/UDP禁止失败；本轮权限恢复后成功启动。记录目录start/qt_work/heartbeat_online_20261006_151124（current_feature_deployment/current_manual_observer），运行日志start/logs/heartbeat_online_20261006_151124.
+- 明确通过地图会话online启动，spawn_request模式ONLINE，未导入预建地图。环境空DRONE_PREBUILT_MAP被roslaunch默认地图参数回退，此次启动使用/drone/map_session action online完成无图切换；空参数默认回退仍需后续修正。本轮未修改导航/健康判定或0.3sim秒心跳阈值。
+- flight_manager增加可选record_heartbeat_diagnostics（默认false），本次true：在原心跳判定位置发布/drone/planner_heartbeat_diagnostic数组[callback_now,source_stamp,age,accepted,last_accepted,goal_start,navigating]，不改变接受条件。launch/start_simulation新增诊断参数/DRONE_RECORD_HEARTBEAT，Python AST及shell/XML通过，纯Python配置改动无需C++编译。
+- heartbeat_observer记录原始DataDisp接收、管理器接受/拒绝、planning_enabled/阶段/健康/握手日志、按进程CPU/RSS/线程及仿真墙钟倍率；resource_observer额外记录整机/逐核CPU、负载和可用内存。原monitor/reference_observer记录位置/朝向/队列/全局与执行曲线。CSV和JSONL持续落盘。
+- rosbag记录clock、DataDisp、判定诊断、planning_enabled、manager heartbeat、phase/health/stage、队列/目标/GlobalRoute/Bspline、FCU里程计/setpoint及rosout/LIOhealth，128MB分卷；没有相机、原始点云或巨大体素话题。录包active应在用户实验完成后SIGINT关闭再分析，防止索引未落盘。记录启动覆盖解锁/飞行前，整机资源从中段启动阶段开始。
+- startup_ready.json确认sim65.330 READY/HEALTHY、connected=true/armed=false、landed_state1、map_session ONLINE ready=true、map backend MAPPING、alignment=true。只读topic info核对心跳诊断和原始心跳均被observer及rosbag订阅。没有自动ARM、起飞或发送目标。
+- 当前进程：launcher=8883, monitor.py=9329, reference_observer.py=9330, heartbeat_observer.py=9331, rosbag=10726, qt=8960, lio=8978, ego=8991, manager=9033, map_session=9037, gzserver=10015, gzclient=9916, px4=10355, resource_observer.py=11259. 用户可手动实验，后台持续记录。后续先看heartbeat_decisions.csv中接受/未来/过期/重复时间、heartbeat_arrivals与启动握手和CPU同步关系，避免仅凭负载猜原因。
+
+## 2026-10-05 默认带图先选出生位姿；在线障碍目标跳点已编译部署
+
+- 用户反馈手动修改地图初始位姿未改变实际Gazebo位置，以及在线目标进入障碍会清空全部队列。本轮默认先启动ROS+Qt并预览场景地图，WAITING_POSE时不启动Gazebo/PX4；Qt出生位置/拖动航向确认经/drone/map_session生成/drone/simulation_spawn_request，启动器以墙钟等待，随后才启动PX4/Gazebo。spawn_model接收X/Y/Z及-Y弧度yaw，prepare_px4_sitl.py将补丁持久化。Gazebo GUI也在确认后启动并归启动器清理；等待进程纳入独立受管进程组，TERM可以中断等待。
+- 默认地图start/maps/inspection_demo_scene.dmap使用场景世界ENU。Qt默认出生[1.01,0.98,0.17]、yaw0，可点击XY并拖朝向；平地Z限制0.15～0.20m、XY±8m、距地图原始障碍至少0.55m。定位就绪后核对实际出生与请求（位置差≤0.1m、yaw差≤5°），加载对齐地图。已经初始化的受管仿真不允许仅改TF重设出生位姿，需重启。LIO持续在线定位，真值只用于初始对齐/核对，不进入EKF。Faster-LIO不进行预建点云匹配重定位。
+- 支持Qt启动前“返回在线建图导航”/“开始新建图”，或DRONE_PREBUILT_MAP=直接在线启动。MapArchive新增clip_to_navigation_grid，仅仿真自动加载启用：变换原始体素盒与当前网格取交，远于导航范围的地图部分可裁剪；有效飞行体积在网格内部，保守膨胀重建，历史自由非对齐不导入。手动加载默认仍拒绝越界。
+- flight_manager订阅实际/drone/map_mode；只有MAPPING在线模式跳过障碍点。入队已知占据点拒绝但不清其余队列；下一点派发时最新地图判占据则逐点跳过；当前目标被实测占据则invalidate旧规划/清旧曲线、HOLD保留后续队列，0.3sim秒后依次派发（全跳完则HOLD）。定位/地图过期、OFFBOARD丢失等安全保护仍可取消全队列。带图障碍点规则保持原状。
+- Python AST、XML、bash -n及git diff --check通过；完整catkin_make -j1 -l1退出0，随后Qt预览状态补齐的make -C build drone_operator_gui -j1退出0。Qt在WAITING_POSE/STARTING_SIM显示地图预览、隐藏实时层，初始位姿按钮在未连接FCU时可用；启动提示不再将尚未启动的时钟说成冻结。
+- 当前运行日志start/logs/20261005_222419，部署/只读记录start/qt_work/pose_spawn_queue_final_20261005_222214（current_feature_deployment/current_manual_observer）。只读核对WAITING_POSE、ready=false、53392预览点/frame map、没有spawn_request且gzserver/PX4未运行；Qt截图已看到场景墙/柱预览（可能被终端遮挡）。进程：launcher=2251158, qt=2251240, manager=2251316, map_session=2251325, ego=2251273, monitor.py=2251656, reference_observer.py=2251657.
+- 没有代用户选位姿/确认启动、没有解锁/起飞，也未运行导航跳点飞行回归。下一步用户在Qt右侧地图栏选择出生点和朝向后确认，观察实际Gazebo生成位姿/带图就绪，再手动实验；只读观察已预先运行。当前修改未提交/推送，GitHub仍为11c9129基线。README最新流程取代前面的自动真值带图启动描述。
+
+## 2026-10-05 当前代码编译完成，场景预建地图已加载启动
+
+- 用户要求编译当前代码、建立当前仿真场景地图并带图启动。完整catkin_make -j1 -l1退出0，首次启动发现地图底部体素的微小坐标变换越界；修复后再次完整编译退出0。后端仅裁掉中心有效的底部体素落在网格下方的部分，XY/顶部越界及体素中心越界仍拒绝。地图预览改批量坐标转换，减少持锁时间和回调阻塞。
+- 新增build_simulation_scene_map.py：仅仿真、连接落地未解锁时，根据当前Gazebo静态方盒碰撞几何生成V2原始占据。资产start/maps/inspection_demo_scene.dmap及同名json，10cm分辨率，53392原始占据、7碰撞盒（四墙/两柱/黄色设备）、无伪造自由证据。地图是仿真几何先验，不是飞行雷达扫描图；无碰撞的视觉靶和导航高度以下地板不纳入。实测雷达继续确认/清除，观测自由安全检查保留。
+- 新启动方式DRONE_PREBUILT_MAP=/home/d/robotproject/project0/start/maps/inspection_demo_scene.dmap bash src/drone_stack/scripts/start_simulation.sh。launch传入地图会话及Qt默认文件；READY/HEALTHY落地上锁后用Gazebo机体真值做一次地图初始对齐、加载。该真值不进入Faster-LIO、EKF或持续控制；实机手动点选初始位置/拖朝向流程保留。
+- 最终运行start/logs/20261005_213729；部署及只读观察start/qt_work/premap_final_20261005_213729（current_feature_deployment/current_manual_observer）。sim66.902确认READY/HEALTHY、FCU connected=true/armed=false、landed_state1、alignment=true、地图后端/会话PRIOR_NAV且ready=true。没有解锁、起飞或发送导航目标。
+- sim88.010只读抽样Qt同源膨胀显示182940体素；转换到地图坐标后，七处障碍中心到最近膨胀体素均小于5.9cm，确认所有场景障碍已进入地图。此项仅核对加载与坐标，不代表飞行规划/动态清除已验收。startup_ready.json/map_geometry_observation.json/deployment.json保存证据与指纹；Qt及Gazebo窗口存在，Qt已置于前面。
+- 进程：launcher=2243204, gzclient=2244199, monitor.py=2244200, reference_observer.py=2244201, qt=2243282, manager=2243393, map_session=2243397, ego=2243337, lio=2243318, gzserver=2243661, px4=2243844. 只读观察持续运行；当前修改未提交、未推送，GitHub仍为修改前基线11c9129。README补充地图生成及带图启动命令。
+
+## 2026-10-05 21:14 三项修改已编译部署，地面就绪；修改前基线已推送GitHub
+
+- 按用户顺序先更新根README并提交现有全部项目源码/小型分析文档，GitHub origin/main推送成功且ls-remote核对为11c91294e3933209a7ef0f9dcdff9343eeaae8f5。该提交是三个修复之前的基线。后续修复当前为本地未提交改动，未推送；README/无人机栈说明已补新流程。
+- 终点保持最终15cm三维球、≤0.15m/s、稳定1sim秒。确认阶段仅使用同一批准零速度末端（没有合格末端则测得位姿）；瞬时越界/速度/时间抖动重置确认计时，不立即转向。退出半径20cm、持续0.5sim秒或收敛超过4sim秒才重试。每周期独立检查碰撞/自由空间/飞行范围，健康保护不变。
+- 地图新增仿真实际射线流：有效回波hit=1，明确40m无回波miss=0；近场/异常不造自由证据，实机缺失点不是自由射线。桥接按采集时刻传感器外参/FCU位姿发布/drone/mapping/rays，EGO与同步cloud_body_pose配对。先登记命中，再清除实测射线穿越原始占据；只保护命中体素，移除历史15cm邻域保护带，当前膨胀引用随原始占据删除。盲区保留，Qt体素Decay Time0。
+- 首次启动检查无回波会产生56万自由体素；最终版本自由证据仅记录配置导航体积，范围外射线仍删除旧原始占据，降到约16.4万，不增加无用自由传输。地图完整性和动态清除效果仍需飞行回归，不能宣称所有残留已消除。
+- map_session.py及/drone/map_session服务维护地面map→odom对齐；在线READY自动原点/初始机头+X。预建地图Qt先预览、点位置拖朝向（XYZ/yaw可输入）、确认加载，再允许ARM和导航。地图文件V2保存map_from_odom元数据，兼容V1；地图坐标目标/高度换回控制ENU，所有显示层使用同一变换，不改LIO/EKF原点或ENU/NED。手动初始位姿不是自动重定位。
+- Python AST/XML和git diff --check通过，catkin_make -j1 -l1、Qt目标编译及最终完整编译退出0。源码/二进制指纹与日志start/qt_work/three_fixes_final_20261005_211423（current_feature_deployment）；sim65.176只读地面READY/HEALTHY、connected=true、armed=false、AUTO.LOITER、landed_state1、alignment_ready=true、ONLINE。
+- 最终运行start/logs/20261005_211423；launcher2233736、Qt2233825、manager2233891、map_session2233892、global2233895、EGO2233847、LIO2233833、gzserver2234202、gzclient2234701。新地图流10071点：4531回波+5540明确无回波，observed_free163996、inflated127381，采集年龄约0.97sim秒（地面抽样）。没有ARM/起飞/导航或地图存取/切换测试，三个问题尚未飞行验收。
+- 旧实验监测已在确认落地上锁后停止。最终只读monitor2234721、reference_observer2234722持续记录，current_manual_observer指向最终部署目录；没有启动额外原始点云订阅诊断（避免重复解码负担）。Qt/Gazebo打开，GUI screenshot可能被终端覆盖，不能作为地图初始位姿交互验收证据。下一步由用户手动复试终点、多点、地图动态清除和预建初始位姿。
+
 ## 2026-10-05 本轮终点/地图残留/初始位姿需求已记录，尚未修改
 
 - 首点终点问题已定位：sim126.492距目标10.6cm进入确认，sim127.39距15.0000205cm速度仅0.0094m/s，硬15cm门槛失效，127.408重规划、机头反向至-132.32度，132.126才到达。需要确认阶段滞回和安全末端控制，不能通过放宽最终到达容差掩盖。

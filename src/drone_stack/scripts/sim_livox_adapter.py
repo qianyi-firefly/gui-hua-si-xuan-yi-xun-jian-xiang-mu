@@ -5,16 +5,24 @@ All rays in one Gazebo scan describe the same instant. Marking them as a
 rolling scan would create fictitious motion distortion during flight.
 """
 import math
+import time
+import threading
+import numpy as np
 
 import rospy
 from livox_ros_driver2.msg import CustomMsg, CustomPoint
-from sensor_msgs.msg import PointCloud, Imu
+from sensor_msgs.msg import PointCloud, Imu, PointCloud2, PointField
+from std_msgs.msg import Float64MultiArray
 from std_srvs.srv import SetBool, SetBoolResponse
 
 
 class Adapter:
     def __init__(self):
+        self.latency_previous=None
+        self.latency_enabled=rospy.get_param('/drone/record_lio_latency',False)
+        self.latency_pub=rospy.Publisher('/drone/latency/lidar_adapter',Float64MultiArray,queue_size=50) if self.latency_enabled else None
         self.publisher = rospy.Publisher('/livox/lidar', CustomMsg, queue_size=2)
+        self.ray_publisher = rospy.Publisher('/drone/sim/lidar/mapping_rays', PointCloud2, queue_size=1)
         self.imu_publisher = rospy.Publisher('/livox/imu', Imu, queue_size=100)
         # Exclude spawn/contact impulses from Faster-LIO's one-shot gravity
         # and accelerometer scale initialisation. It needs stationary IMU data.
@@ -33,8 +41,26 @@ class Adapter:
         rospy.Subscriber('/drone/sim/lidar/points', PointCloud, self.on_cloud, queue_size=1)
 
     def on_cloud(self, cloud):
+        callback_mono=time.monotonic() if self.latency_enabled else 0.
+        callback_cpu=time.thread_time() if self.latency_enabled else 0.
+        callback_sim=rospy.Time.now().to_sec() if self.latency_enabled else 0.
         if self.drop_lidar or cloud.header.stamp.to_sec() < self.startup_settle:
             return
+        # Mapping observes actual Gazebo beams, including explicit max-range
+        # no-return rays. Missing Livox points on hardware are NEVER free rays.
+        xyz = np.asarray([[p.x,p.y,p.z] for p in cloud.points[::2]], dtype=np.float32)
+        radius = np.linalg.norm(xyz, axis=1)
+        hit = (radius >= self.min_useful_range) & (radius < self.max_range-.05)
+        miss = np.isfinite(radius) & (radius >= self.max_range-.001) & (radius <= self.max_range+.001)
+        accepted = (hit|miss) & np.all(np.isfinite(xyz),axis=1)
+        rays = np.empty((int(accepted.sum()),4),dtype=np.float32)
+        rays[:,:3] = xyz[accepted]
+        rays[:,3] = hit[accepted].astype(np.float32)
+        message = PointCloud2(header=cloud.header,height=1,width=len(rays),is_bigendian=False,
+                             point_step=16,row_step=16*len(rays),is_dense=True,data=rays.tobytes())
+        message.fields = [PointField(name=n,offset=4*i,datatype=PointField.FLOAT32,count=1)
+                          for i,n in enumerate(['x','y','z','intensity'])]
+        self.ray_publisher.publish(message)
         points = cloud.points[::self.step]
         if len(points) < 2:
             return
@@ -67,7 +93,18 @@ class Adapter:
         out.point_num = len(out.points)
         if out.point_num >= 2:
             rospy.loginfo_throttle(10.0, 'Livox sim adapter: %d/%d valid rays', out.point_num, len(points))
+            begin=time.monotonic() if self.latency_enabled else 0.
             self.publisher.publish(out)
+            if self.latency_enabled:
+                end=time.monotonic()
+                thread=threading.get_ident();previous=self.latency_previous
+                between_cpu=callback_cpu-previous[1] if previous is not None and previous[0]==thread else -1.
+                between_wall=callback_mono-previous[2] if previous is not None and previous[0]==thread else -1.
+                # out.header is the packet BEGIN; C++ reports both begin/end.
+                self.latency_pub.publish(Float64MultiArray(data=[out.header.stamp.to_sec(),callback_sim,
+                    callback_mono,begin,end,rospy.Time.now().to_sec(),time.thread_time()-callback_cpu,
+                    float(out.point_num),float(len(cloud.points)),between_cpu,between_wall]))
+                self.latency_previous=(thread,time.thread_time(),time.monotonic())
 
     def on_imu(self, msg):
         if not self.drop_imu and msg.header.stamp.to_sec() >= self.startup_settle:
